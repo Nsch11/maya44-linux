@@ -987,7 +987,7 @@ def main():
     parser.add_argument("--capture-ready", type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--theme', choices=('system', 'light', 'dark'), help='Appearance override (not saved)')
     parser.add_argument('--language', choices=('system', 'en', 'ru'), help='Interface language override (not saved)')
-    parser.add_argument('--page', choices=('mixer', 'outputs', 'inputs', 'settings'), default='mixer', help='Page to show')
+    parser.add_argument('--page', choices=('mixer', 'settings'), default='mixer', help='Page to show')
     args = parser.parse_args()
     if args.snapshot:
         args.demo = True

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MAYA44 Mixer
+Name[ru]=Микшер MAYA44
+Comment=Control ESI MAYA44 PCIe audio interfaces
+Comment[ru]=Управление звуковыми картами ESI MAYA44 PCIe
+Exec=maya44e-mixer --show
+TryExec=maya44e-mixer
+Icon=maya44e-mixer
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupNotify=true

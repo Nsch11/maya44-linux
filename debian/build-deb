@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+package=$1
+stage=$(mktemp -d "debian/.deb-$package.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+trap 'exit 1' HUP INT TERM
+
+# mktemp makes the staging directory private. The package root must be traversable.
+chmod 0755 "$stage"
+doc="$stage/usr/share/doc/$package"
+install -d "$stage/DEBIAN" "$doc"
+install -m644 debian/copyright "$doc/copyright"
+gzip -9n < debian/changelog > "$doc/changelog.Debian.gz"
+
+case "$package" in
+    maya44e-dkms)
+        version=$2
+        source_dir="$stage/usr/src/maya44e-$version"
+        install -d "$source_dir"
+        install -m644 kernel/maya44e.c kernel/Kbuild "$source_dir/"
+        sed "s/@VERSION@/$version/g" packaging/dkms.conf > "$source_dir/dkms.conf"
+        sh debian/maya44e-dkms-integrate "$stage"
+        for script in preinst postinst prerm postrm; do
+            sed "s/@DKMS_VERSION@/$version/g" "debian/$package.$script" > "$stage/DEBIAN/$script"
+            chmod 0755 "$stage/DEBIAN/$script"
+        done
+        printf '%s\n' /etc/modprobe.d/maya44e.conf > "$stage/DEBIAN/conffiles"
+        ;;
+    maya44e-mixer)
+        data="$stage/usr/share/$package"
+        install -d "$data/assets" "$data/translations" "$data/wireplumber" "$doc/examples"
+        for source in panel/*.py; do
+            case "${source##*/}" in check_*.py) continue ;; esac
+            install -m644 "$source" "$data/"
+        done
+        install -m644 panel/assets/*.svg "$data/assets/"
+        install -m644 panel/translations/maya44e_ru.qm "$data/translations/"
+        install -m644 panel/assets/LUCIDE-LICENSE.txt "$doc/"
+        install -m644 config/53-maya44e-stereo.conf config/maya44e-stereo.lua "$data/wireplumber/"
+        install -Dm755 "debian/$package" "$stage/usr/bin/$package"
+        install -Dm644 "debian/$package.desktop" "$stage/usr/share/applications/$package.desktop"
+        install -Dm644 panel/assets/maya44e.svg "$stage/usr/share/icons/hicolor/scalable/apps/$package.svg"
+        install -m644 "debian/$package-autostart.desktop" "$doc/examples/$package.desktop"
+        ;;
+    *)
+        printf 'Unknown package %s\n' "$package" >&2
+        exit 2
+        ;;
+esac
+
+(
+    cd "$stage"
+    find . -type f ! -path './DEBIAN/*' -printf '%P\0' | LC_ALL=C sort -z | xargs -0 md5sum
+) > "$stage/DEBIAN/md5sums"
+dpkg-gencontrol -p"$package" -P"$stage"
+dpkg-deb --build --root-owner-group "$stage" ..

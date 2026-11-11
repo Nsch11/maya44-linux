@@ -7,3 +7,5 @@ __pycache__/
 .*.cmd
 Module.symvers
 modules.order
+/debian/files
+/debian/.deb-*/

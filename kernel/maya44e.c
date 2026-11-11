@@ -44,16 +44,6 @@ static bool experimental;
 module_param(experimental, bool, 0444);
 MODULE_PARM_DESC(experimental, "Required opt-in for an experimental analog playback/capture driver");
 
-static bool codec_power_compat;
-module_param(codec_power_compat, bool, 0444);
-MODULE_PARM_DESC(codec_power_compat,
-		 "Legacy parameter retained for reload compatibility; capture now always powers the ADC");
-
-static bool codec_full_init;
-module_param(codec_full_init, bool, 0444);
-MODULE_PARM_DESC(codec_full_init,
-		 "Legacy parameter retained for reload compatibility; full codec setup is now mandatory");
-
 static bool diagnostic_controls;
 module_param(diagnostic_controls, bool, 0444);
 MODULE_PARM_DESC(diagnostic_controls,

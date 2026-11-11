@@ -23,9 +23,49 @@ has 24 significant bits. The mixer offers 44.1, 48, 88.2 and 96 kHz and period
 sizes of 64, 128, 256, 512 or 1024 frames. The hardware PCM buffer uses two
 periods.
 
-## Install the experimental driver
+## Install the Kubuntu packages
 
-The DKMS installer targets Debian and Ubuntu systems with systemd and x86-64.
+The test packages target Kubuntu 26.04 on amd64. Put the two downloads in
+their own directory, install the headers for the running kernel, and then
+install the driver and mixer.
+
+```sh
+sudo apt install "linux-headers-$(uname -r)"
+sudo apt install ./maya44e-dkms_*_amd64.deb ./maya44e-mixer_*_all.deb
+```
+
+If you installed alpha.1 with `packaging/install.py`, remove that
+installation first using `sudo maya44e-install remove`. This keeps
+the saved ALSA state and leaves the running module loaded. The package
+refuses to overwrite an installation managed by the old script. Reboot
+after installing the driver to load the packaged build.
+
+Start **MAYA44 Mixer** from the application menu or run
+`maya44e-mixer --show`. If the mixer from a source checkout is already
+running, quit it from the tray before launching the packaged mixer.
+To start it in the tray at login, copy the example
+`/usr/share/doc/maya44e-mixer/examples/maya44e-mixer.desktop` into
+`~/.config/autostart/`. If a user autostart entry already launches
+the source checkout, replace that entry with the packaged one.
+
+Install newer `.deb` files with the same `apt install` command to
+upgrade. DKMS rebuilds the module for kernel updates with matching
+headers. Ubuntu may prompt you to enroll a Machine Owner Key to load
+the module with Secure Boot enabled.
+
+Check the installed versions with `dpkg -l maya44e-dkms maya44e-mixer`
+and the module builds with `dkms status -m maya44e`. To remove both
+packages, run `sudo apt remove maya44e-dkms maya44e-mixer`. Reboot
+to unload the running driver.
+
+To build the two packages locally on amd64, run
+`dpkg-buildpackage --build=binary -us -uc` with `dpkg-dev` and `make` installed.
+The resulting files are placed in the parent directory.
+
+## Install the experimental driver from source
+
+The standalone DKMS installer targets Debian and Ubuntu systems with systemd
+and x86-64. Use it on systems where the `maya44e-dkms` package is absent.
 The driver was developed and tested on Kubuntu with Linux 7.0 kernels.
 Install matching kernel headers for every kernel you want DKMS to build for.
 The installer stops if `mokutil` reports that Secure Boot is enabled.
@@ -65,13 +105,16 @@ The mixer uses the controls exposed by the experimental DKMS driver.
 
 WirePlumber 0.5 can expose output pairs 1/2 and 3/4 as separate stereo devices.
 In Plasma, select the card's multichannel duplex profile and install the
-matching rule and script as your desktop user.
+matching rule and script as your desktop user. The mixer package installs
+copies in `/usr/share/maya44e-mixer/wireplumber/`. In the commands below,
+use that directory as `policy_dir` when installing from the package.
 
 ```sh
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d"
 scripts_dir="${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts"
-install -Dm644 config/53-maya44e-stereo.conf "$config_dir/53-maya44e-stereo.conf"
-install -Dm644 config/maya44e-stereo.lua "$scripts_dir/maya44e-stereo.lua"
+policy_dir=config
+install -Dm644 "$policy_dir/53-maya44e-stereo.conf" "$config_dir/53-maya44e-stereo.conf"
+install -Dm644 "$policy_dir/maya44e-stereo.lua" "$scripts_dir/maya44e-stereo.lua"
 systemctl --user restart wireplumber
 ```
 

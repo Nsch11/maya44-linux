@@ -1,0 +1,25 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: MAYA44 Linux
+Source: https://github.com/Nsch11/maya44-linux
+
+Files: *
+Copyright: 2026 MAYA44 Linux contributors
+License: GPL-3+
+
+Files: kernel/*
+Copyright: 2026 MAYA44 Linux contributors
+License: GPL-2
+
+Files: panel/assets/link-2.svg
+Copyright: 2026 Lucide Icons and Contributors
+ 2013-present Cole Bemis
+License: ISC and Expat
+ See the complete notices in /usr/share/doc/maya44e-mixer/LUCIDE-LICENSE.txt.
+
+License: GPL-2
+ On Debian-based systems, the complete GNU General Public License version 2
+ is available at /usr/share/common-licenses/GPL-2.
+
+License: GPL-3+
+ On Debian-based systems, the complete GNU General Public License version 3
+ is available at /usr/share/common-licenses/GPL-3.

@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+DKMS_VERSION := $(shell dpkg-parsechangelog -S Version | sed 's/^[0-9]*://')
+
+.NOTPARALLEL:
+.PHONY: clean build build-arch build-indep binary binary-arch binary-indep
+
+clean:
+	rm -f debian/files
+
+build: build-arch build-indep
+
+build-arch build-indep:
+
+binary: binary-arch binary-indep
+
+binary-arch: build-arch
+	sh debian/build-deb maya44e-dkms "$(DKMS_VERSION)"
+
+binary-indep: build-indep
+	sh debian/build-deb maya44e-mixer

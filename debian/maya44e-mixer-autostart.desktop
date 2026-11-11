@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MAYA44 Mixer
+Name[ru]=Микшер MAYA44
+Exec=maya44e-mixer --tray
+TryExec=maya44e-mixer
+Icon=maya44e-mixer
+Terminal=false
+OnlyShowIn=KDE;

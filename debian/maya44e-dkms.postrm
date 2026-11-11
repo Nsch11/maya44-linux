@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+case "$1" in
+    remove|purge|abort-install)
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null; then
+            systemctl daemon-reload || true
+        fi
+        if [ -S /run/udev/control ] && command -v udevadm >/dev/null; then
+            udevadm control --reload || true
+        fi
+        ;;
+esac

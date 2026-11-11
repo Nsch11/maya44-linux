@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+staging=${1:?missing driver package staging directory}
+install -Dm755 packaging/maya44e-state "$staging/usr/libexec/maya44e-state"
+install -d "$staging/etc/modprobe.d" "$staging/usr/lib/udev/rules.d" \
+    "$staging/usr/lib/systemd/system/alsa-restore.service.d"
+sed 's/Managed by maya44e-install/Provided by maya44e-dkms/' \
+    packaging/maya44e.conf >"$staging/etc/modprobe.d/maya44e.conf"
+sed 's@/usr/local/libexec/@/usr/libexec/@g' packaging/89-maya44e-state.rules \
+    >"$staging/usr/lib/udev/rules.d/89-maya44e-state.rules"
+sed -e 's/Managed by maya44e-install/Provided by maya44e-dkms/' \
+    -e 's@/usr/local/libexec/@/usr/libexec/@g' packaging/maya44e-state.conf \
+    >"$staging/usr/lib/systemd/system/alsa-restore.service.d/maya44e-state.conf"
+chmod 0644 "$staging/etc/modprobe.d/maya44e.conf" \
+    "$staging/usr/lib/udev/rules.d/89-maya44e-state.rules" \
+    "$staging/usr/lib/systemd/system/alsa-restore.service.d/maya44e-state.conf"

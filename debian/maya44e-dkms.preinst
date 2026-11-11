@@ -1,0 +1,36 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+legacy_installation() {
+    cat >&2 <<'EOF'
+The previous standalone MAYA44e installation must be removed first.
+Run sudo maya44e-install remove if the standalone installer has an installation receipt.
+Without a receipt, inspect dkms status and remove the old MAYA44e
+registration and any standalone ALSA state hooks before retrying.
+EOF
+    exit 1
+}
+
+case "$1" in
+    install|upgrade)
+        if [ -e /var/lib/maya44e/installation.json ]; then
+            legacy_installation
+        fi
+        for registration in /var/lib/dkms/maya44e/0.1.20261027.*; do
+            if [ -e "$registration" ]; then
+                legacy_installation
+            fi
+        done
+        # These overrides would shadow the hooks shipped under /usr/lib.
+        if grep -qsF /usr/local/libexec/maya44e-state \
+            /etc/udev/rules.d/89-maya44e-state.rules \
+            /etc/systemd/system/alsa-restore.service.d/maya44e-state.conf; then
+            legacy_installation
+        fi
+        if [ -e /etc/alsa/state-daemon.conf ]; then
+            echo 'maya44e-dkms requires the ALSA restore service to keep phantom power off during state restore.' >&2
+            exit 1
+        fi
+        ;;
+esac

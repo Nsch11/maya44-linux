@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure)
+        if [ -e /var/lib/alsa/asound.state ]; then
+            /usr/libexec/maya44e-state
+        fi
+        # Upgrades remove the old registration from every kernel, including
+        # fallback kernels that are neither running nor the newest.
+        autoinstall_all_kernels=yes /usr/lib/dkms/common.postinst \
+            maya44e '@DKMS_VERSION@' /usr/share/maya44e-dkms '' "${2:-}"
+        # Reload configuration for future events without restarting audio.
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null; then
+            systemctl daemon-reload || true
+        fi
+        if [ -S /run/udev/control ] && command -v udevadm >/dev/null; then
+            udevadm control --reload || true
+        fi
+        ;;
+esac

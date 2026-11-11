@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # An interrupted removal or a failed configuration may already have
+        # removed the registration. Never touch another package version.
+        if [ -d '/var/lib/dkms/maya44e/@DKMS_VERSION@' ] && command -v dkms >/dev/null; then
+            dkms remove -m maya44e -v '@DKMS_VERSION@' --all
+        fi
+        ;;
+esac
