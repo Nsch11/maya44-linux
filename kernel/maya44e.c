@@ -178,7 +178,7 @@ struct maya_capture {
 	struct snd_pcm_substream *substream;
 	void *ring[2];
 	dma_addr_t dma[2];
-	bool running;
+	bool running, preparing;
 	unsigned int period, frames, position;
 	u64 periods, starts, stops, copied_frames;
 };
@@ -198,6 +198,7 @@ struct maya {
 	struct maya_capture capture;
 	unsigned int reserved_rate[2];
 	u8 input_volume[2][2], input_gain[2], input_source[2];
+	u8 input_pga_volume[2][2];
 	bool input_enabled[2], monitor[2], phantom;
 	u8 spdif_source;
 	bool spdif_professional, spdif_loopback, spdif_enabled;
@@ -213,6 +214,7 @@ struct maya {
 	void *ring[2], *desc_allocation, *table;
 	dma_addr_t ring_dma[2], desc_dma, table_dma;
 	bool enabled, regions, irq_requested, running, fault, removing, suspended;
+	bool playback_preparing;
 	bool diagnostic_inputs_running, diagnostic_inputs_ready;
 	unsigned int suspend_rate;
 	u64 suspend_count, resume_count, resume_errors;
@@ -318,7 +320,7 @@ static int maya_spdif_capture_check(struct maya *m, unsigned int rate)
 }
 
 /* Caller holds m->lock, or probe/free has exclusive ownership. */
-static void maya_quiesce(struct maya *m)
+static void maya_quiesce(struct maya *m, bool mmio_active)
 {
 	unsigned int slot;
 
@@ -326,13 +328,17 @@ static void maya_quiesce(struct maya *m)
 	m->capture.running = false;
 	m->diagnostic_inputs_running = false;
 	m->diagnostic_inputs_ready = false;
+	WRITE_ONCE(m->phantom, false);
 	pci_intx(m->pci, 0);
 	pci_clear_master(m->pci);
-	if (m->io && !m->suspended) {
+	if (m->io && mmio_active) {
 		for (slot = 0; slot < 4; ++slot) {
 			mw8(m, 0x192 + slot * 4, 2);
 			mw8(m, 0x80 + slot * 0x20, 0);
 		}
+		mw8(m, 0x481, mr8(m, 0x481) & ~BIT(6));
+		/* Flush posted DMA stop and GPIO writes before leaving D0. */
+		mr8(m, 0x481);
 	}
 }
 
@@ -341,7 +347,7 @@ static void maya_fatal(struct maya *m)
 	bool notify = !m->fault && !m->removing && !m->suspended && m->pcm;
 
 	m->fault = true;
-	maya_quiesce(m);
+	maya_quiesce(m, !m->suspended && !pci_channel_offline(m->pci));
 	/* Fatal callers can hold stream/device locks. Notify ALSA elsewhere. */
 	if (notify)
 		schedule_work(&m->fault_work);
@@ -619,7 +625,7 @@ static int maya_controller_init(struct maya *m)
 /* Input DMA has the same two-descriptor layout as output, but format 0x77.
  * Only the input engines are reset here; active playback is never touched.
  */
-static int maya_capture_rearm(struct maya *m, unsigned int pair)
+static int maya_capture_reset(struct maya *m, unsigned int pair)
 {
 	unsigned int b = 0x80 + pair * 0x20, ir = 0x190 + pair * 4, i;
 
@@ -638,6 +644,13 @@ static int maya_capture_rearm(struct maya *m, unsigned int pair)
 		return -ETIMEDOUT;
 	}
 	mw8(m, b, 0);
+	return 0;
+}
+
+static void maya_capture_program(struct maya *m, unsigned int pair)
+{
+	unsigned int b = 0x80 + pair * 0x20, ir = 0x190 + pair * 4;
+
 	mw32(m, b + 0x18, lower_32_bits(m->table_dma + pair * 0x100));
 	mw32(m, b + 0x1c, 0);
 	mw16(m, b + 0x10, 0x77);
@@ -645,7 +658,15 @@ static int maya_capture_rearm(struct maya *m, unsigned int pair)
 	mw8(m, b + 0x0c, 1);
 	mw32(m, b + 8, m->capture.frames * 8);
 	mw16(m, ir, m->capture.period);
-	return 0;
+}
+
+static int maya_capture_rearm(struct maya *m, unsigned int pair)
+{
+	int err = maya_capture_reset(m, pair);
+
+	if (!err)
+		maya_capture_program(m, pair);
+	return err;
 }
 
 static int maya_capture_stop(struct maya *m)
@@ -662,6 +683,8 @@ static int maya_capture_stop(struct maya *m)
 		mw8(m, 0x192 + pair * 4, 2);
 		mw8(m, 0x80 + pair * 0x20, 0);
 	}
+	/* Flush posted STOP writes before touching the capture DMA layout. */
+	mr32(m, 0x80);
 	return 0;
 }
 
@@ -711,7 +734,7 @@ static void maya_capture_period(struct maya *m)
 				 pass[3] ? le32_to_cpu(right[i * 2 + 1]) : 0,
 				 runtime->format);
 	}
-	c->position = (start + c->period) % c->frames;
+	WRITE_ONCE(c->position, (start + c->period) % c->frames);
 	c->copied_frames += c->period;
 	c->periods++;
 }
@@ -728,14 +751,14 @@ static irqreturn_t maya_irq(int irq, void *opaque)
 
 	spin_lock_irqsave(&m->lock, flags);
 	m->irq_total++;
-	if (m->fault || m->removing || m->suspended) {
+	if (!m->irq_requested || m->fault || m->removing || m->suspended) {
 		m->irq_unhandled++;
 		spin_unlock_irqrestore(&m->lock, flags);
 		return IRQ_NONE;
 	}
 	summary = mr32(m, 0x4b0);
 	m->last_summary = summary;
-	if (!summary) {
+	if (!summary || summary == ~0U) {
 		m->irq_unhandled++;
 		spin_unlock_irqrestore(&m->lock, flags);
 		return IRQ_NONE;
@@ -807,7 +830,8 @@ unlock:
 static const struct snd_pcm_hardware maya_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-		SNDRV_PCM_INFO_SYNC_APPLPTR | SNDRV_PCM_INFO_NO_REWINDS,
+		SNDRV_PCM_INFO_SYNC_APPLPTR | SNDRV_PCM_INFO_NO_REWINDS |
+		SNDRV_PCM_INFO_JOINT_DUPLEX,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_3LE |
 		SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_8000_48000 | SNDRV_PCM_RATE_24000 |
@@ -849,6 +873,46 @@ static int maya_hw_free(struct snd_pcm_substream *s)
 	return 0;
 }
 
+static int maya_rate_rule(struct snd_pcm_hw_params *params,
+			 struct snd_pcm_hw_rule *rule)
+{
+	struct snd_pcm_substream *s = rule->private;
+	struct maya *m = snd_pcm_substream_chip(s);
+	struct snd_interval limit = { .integer = 1 };
+	unsigned int rate;
+
+	mutex_lock(&m->codec_lock);
+	rate = m->reserved_rate[1 - s->stream];
+	mutex_unlock(&m->codec_lock);
+	if (!rate)
+		return 0;
+
+	limit.min = rate;
+	limit.max = rate;
+	return snd_interval_refine(hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE),
+				   &limit);
+}
+
+static int maya_pcm_constraints(struct snd_pcm_substream *s)
+{
+	struct snd_pcm_runtime *r = s->runtime;
+	int err;
+
+	err = snd_pcm_hw_constraint_integer(r, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_constraint_list(r, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+					 &maya_period_constraints);
+	if (err < 0)
+		return err;
+	/* S32_LE carries 24 significant MSBs. */
+	err = snd_pcm_hw_constraint_msbits(r, 0, 32, 24);
+	if (err < 0)
+		return err;
+	return snd_pcm_hw_rule_add(r, 0, SNDRV_PCM_HW_PARAM_RATE, maya_rate_rule,
+				   s, SNDRV_PCM_HW_PARAM_RATE, -1);
+}
+
 static int maya_open(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
@@ -870,15 +934,7 @@ static int maya_open(struct snd_pcm_substream *s)
 		s->runtime->hw.rate_max = diagnostic_rate;
 		s->runtime->hw.rate_min = diagnostic_rate;
 	}
-	err = snd_pcm_hw_constraint_integer(s->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
-	if (err < 0)
-		return err;
-	err = snd_pcm_hw_constraint_list(s->runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					 &maya_period_constraints);
-	if (err < 0)
-		return err;
-	/* S32_LE carries 24 significant MSBs; S16/S24 retain their nominal width. */
-	err = snd_pcm_hw_constraint_msbits(s->runtime, 0, 32, 24);
+	err = maya_pcm_constraints(s);
 	if (err < 0)
 		return err;
 	spin_lock_irqsave(&m->lock, flags);
@@ -905,10 +961,15 @@ static int maya_close(struct snd_pcm_substream *s)
 static int maya_pcm_ioctl(struct snd_pcm_substream *s, unsigned int cmd, void *arg)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
+	unsigned long flags;
 	int err = snd_pcm_lib_ioctl(s, cmd, arg);
 
-	if (!err && cmd == SNDRV_PCM_IOCTL1_RESET)
-		m->last_appl = s->runtime->status->hw_ptr;
+	/* The legacy PCM core updates appl_ptr separately after this ioctl. */
+	if (!err && cmd == SNDRV_PCM_IOCTL1_RESET) {
+		snd_pcm_stream_lock_irqsave(s, flags);
+		WRITE_ONCE(m->last_appl, s->runtime->status->hw_ptr);
+		snd_pcm_stream_unlock_irqrestore(s, flags);
+	}
 	return err;
 }
 
@@ -942,7 +1003,7 @@ static int maya_prepare_diagnostic_inputs(struct maya *m)
 	}
 	c->period = m->period_frames;
 	c->frames = m->buffer_frames;
-	c->position = 0;
+	WRITE_ONCE(c->position, 0);
 	for (pair = 0; pair < 2; ++pair) {
 		struct maya_desc *d = m->table + pair * 0x100;
 
@@ -987,6 +1048,7 @@ static void maya_start_diagnostic_inputs(struct maya *m)
 static int maya_prepare(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
+	unsigned int pair, pass;
 	unsigned long flags;
 	int err;
 
@@ -998,54 +1060,69 @@ static int maya_prepare(struct snd_pcm_substream *s)
 	    (diagnostic_rate && s->runtime->rate != diagnostic_rate))
 		return -EINVAL;
 	mutex_lock(&m->codec_lock);
-	m->diagnostic_inputs_ready = false;
 	spin_lock_irqsave(&m->lock, flags);
 	if (m->fault || m->removing || m->suspended)
 		err = -EIO;
-	else if (m->running)
+	else if (m->running || m->playback_preparing)
 		err = -EBUSY;
 	else
 		err = maya_stop(m);
-	spin_unlock_irqrestore(&m->lock, flags);
 	if (!err) {
-		unsigned int pair, pass;
+		m->diagnostic_inputs_ready = false;
+		m->playback_preparing = true;
+	}
+	spin_unlock_irqrestore(&m->lock, flags);
+	if (err)
+		goto out;
 
-		/* Reset the old layout first: a failed reset must not replace
-		 * descriptors or the cached geometry. Each reset releases IRQs.
-		 */
-		for (pass = 0; pass < 2 && !err; ++pass) {
-			if (pass) {
-				if (m->period_frames == s->runtime->period_size)
-					break;
-				maya_configure_buffer(m, s->runtime->period_size);
-			}
-			for (pair = 0; pair < 2; ++pair) {
-				spin_lock_irqsave(&m->lock, flags);
-				err = m->fault || m->removing || m->suspended ?
-					-EIO : maya_rearm(m, pair);
-				spin_unlock_irqrestore(&m->lock, flags);
-				if (err)
-					break;
-			}
-		}
-		if (!err) {
+	/* Reset the old layout first: a failed reset must not replace
+	 * descriptors or the cached geometry. Each reset releases IRQs.
+	 */
+	for (pass = 0; pass < 2 && !err; ++pass) {
+		if (pass) {
+			if (m->period_frames == s->runtime->period_size)
+				break;
 			spin_lock_irqsave(&m->lock, flags);
-			err = maya_set_rate(m, s->runtime->rate);
+			maya_configure_buffer(m, s->runtime->period_size);
 			spin_unlock_irqrestore(&m->lock, flags);
 		}
+		for (pair = 0; pair < 2; ++pair) {
+			spin_lock_irqsave(&m->lock, flags);
+			err = m->fault || m->removing || m->suspended ?
+				-EIO : maya_rearm(m, pair);
+			spin_unlock_irqrestore(&m->lock, flags);
+			if (err)
+				break;
+		}
+	}
+	if (!err) {
+		spin_lock_irqsave(&m->lock, flags);
+		err = maya_set_rate(m, s->runtime->rate);
+		spin_unlock_irqrestore(&m->lock, flags);
 	}
 	if (!err && diagnostic_four_dma)
 		err = maya_prepare_diagnostic_inputs(m);
 	mutex_unlock(&m->codec_lock);
-	if (err)
-		return err;
-	memset(m->ring[0], 0, m->buffer_frames * 8);
-	memset(m->ring[1], 0, m->buffer_frames * 8);
-	memset(s->runtime->dma_area, 0,
-	       s->runtime->buffer_size * maya_sample_bytes(s->runtime->format) * 4);
-	m->last_appl = 0;
-	dma_wmb();
-	return 0;
+
+	/* A linked prepare can leave the playback buffer open to ack. */
+	snd_pcm_stream_lock_irqsave(s, flags);
+	if (!err) {
+		memset(m->ring[0], 0, m->buffer_frames * 8);
+		memset(m->ring[1], 0, m->buffer_frames * 8);
+		memset(s->runtime->dma_area, 0,
+		       frames_to_bytes(s->runtime, s->runtime->buffer_size));
+		dma_wmb();
+	}
+	spin_lock(&m->lock);
+	if (!err && (m->fault || m->removing || m->suspended))
+		err = -EIO;
+	m->playback_preparing = false;
+	spin_unlock(&m->lock);
+	snd_pcm_stream_unlock_irqrestore(s, flags);
+	return err;
+out:
+	mutex_unlock(&m->codec_lock);
+	return err;
 }
 
 static int maya_trigger(struct snd_pcm_substream *s, int command)
@@ -1061,6 +1138,11 @@ static int maya_trigger(struct snd_pcm_substream *s, int command)
 	}
 	switch (command) {
 	case SNDRV_PCM_TRIGGER_START:
+		if (m->playback_preparing ||
+		    atomic_read(&s->runtime->buffer_accessing) < 0) {
+			err = -EBUSY;
+			break;
+		}
 		if (diagnostic_four_dma) {
 			if (!m->diagnostic_inputs_ready || m->capture.running) {
 				err = -EIO;
@@ -1106,7 +1188,11 @@ static snd_pcm_uframes_t maya_pointer(struct snd_pcm_substream *s)
 
 	spin_lock_irqsave(&m->lock, flags);
 	m->pointer_calls++;
-	position = m->fault || m->removing || m->suspended ? 0 : mr32(m, 0xc4);
+	if (m->fault || m->removing || m->suspended) {
+		spin_unlock_irqrestore(&m->lock, flags);
+		return 0;
+	}
+	position = mr32(m, 0xc4);
 	m->last_pos[0] = position;
 	frames = m->buffer_frames;
 	spin_unlock_irqrestore(&m->lock, flags);
@@ -1121,29 +1207,40 @@ static int maya_ack(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
 	struct snd_pcm_runtime *r = s->runtime;
-	snd_pcm_uframes_t appl = READ_ONCE(r->control->appl_ptr);
-	snd_pcm_sframes_t count = appl - m->last_appl;
-	snd_pcm_uframes_t frame;
-	unsigned int sample_bytes = maya_sample_bytes(r->format);
 	__le32 *out12 = m->ring[0], *out34 = m->ring[1];
+	snd_pcm_uframes_t appl, frame;
+	snd_pcm_sframes_t count;
+	unsigned int sample_bytes;
+	int err = 0;
 
 	if (READ_ONCE(m->fault) || READ_ONCE(m->removing) || READ_ONCE(m->suspended)) {
 		m->ack_errors++;
 		return -EIO;
 	}
-	if (!sample_bytes) {
+	/* SYNC_PTR can call ack without pinning the managed PCM buffer. */
+	if (!atomic_inc_unless_negative(&r->buffer_accessing)) {
 		m->ack_errors++;
-		return -EINVAL;
+		return -EBUSY;
 	}
+	if (!r->dma_area || !r->buffer_size || r->state == SNDRV_PCM_STATE_SETUP) {
+		err = -EBADFD;
+		goto out;
+	}
+	sample_bytes = maya_sample_bytes(r->format);
+	if (!sample_bytes) {
+		err = -EINVAL;
+		goto out;
+	}
+	appl = READ_ONCE(r->control->appl_ptr);
+	count = appl - m->last_appl;
 	if (count < 0)
 		count += r->boundary;
 	if (count < 0 || count > (snd_pcm_sframes_t)r->buffer_size) {
-		m->ack_errors++;
 		dev_err_ratelimited(&m->pci->dev,
 				    "invalid appl_ptr delta=%ld old=%lu new=%lu boundary=%lu\n",
-
 				    count, m->last_appl, appl, r->boundary);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out;
 	}
 	for (frame = 0; frame < (snd_pcm_uframes_t)count; ++frame) {
 		unsigned int slot = (m->last_appl + frame) % r->buffer_size;
@@ -1158,10 +1255,14 @@ static int maya_ack(struct snd_pcm_substream *s)
 			cpu_to_le32(maya_unpack_sample(source + sample_bytes * 3, r->format));
 	}
 	dma_wmb();
-	m->last_appl = appl;
+	WRITE_ONCE(m->last_appl, appl);
 	m->ack_calls++;
 	m->copied_frames += count;
-	return 0;
+out:
+	atomic_dec(&r->buffer_accessing);
+	if (err)
+		m->ack_errors++;
+	return err;
 }
 
 static int maya_fill_silence(struct snd_pcm_substream *s, int channel,
@@ -1229,14 +1330,7 @@ static int maya_capture_open(struct snd_pcm_substream *s)
 		s->runtime->hw.rate_max = diagnostic_rate;
 		s->runtime->hw.rate_min = diagnostic_rate;
 	}
-	err = snd_pcm_hw_constraint_integer(s->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
-	if (err < 0)
-		return err;
-	err = snd_pcm_hw_constraint_list(s->runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					 &maya_period_constraints);
-	if (err < 0)
-		return err;
-	err = snd_pcm_hw_constraint_msbits(s->runtime, 0, 32, 24);
+	err = maya_pcm_constraints(s);
 	if (err < 0)
 		return err;
 	spin_lock_irqsave(&m->lock, flags);
@@ -1267,6 +1361,7 @@ static int maya_capture_prepare(struct snd_pcm_substream *s)
 	struct maya_capture *c = &m->capture;
 	unsigned long flags;
 	unsigned int pair, half, period = s->runtime->period_size;
+	unsigned int frames = period * 2;
 	int err = 0;
 
 	if (diagnostic_four_dma)
@@ -1279,7 +1374,7 @@ static int maya_capture_prepare(struct snd_pcm_substream *s)
 	spin_lock_irqsave(&m->lock, flags);
 	if (m->fault || m->removing || m->suspended)
 		err = -EIO;
-	else if (c->running)
+	else if (c->running || c->preparing)
 		err = -EBUSY;
 	else
 		err = maya_set_rate(m, s->runtime->rate);
@@ -1287,37 +1382,52 @@ static int maya_capture_prepare(struct snd_pcm_substream *s)
 		err = maya_spdif_capture_check(m, s->runtime->rate);
 	if (!err)
 		err = maya_capture_stop(m);
+	if (!err)
+		c->preparing = true;
 	spin_unlock_irqrestore(&m->lock, flags);
+	if (err)
+		goto out;
+
+	/* Confirm both resets before rewriting the old DMA layout. Let
+	 * playback IRQs run between the two input resets.
+	 */
+	for (pair = 0; pair < 2; ++pair) {
+		spin_lock_irqsave(&m->lock, flags);
+		err = m->fault || m->removing || m->suspended ?
+			-EIO : maya_capture_reset(m, pair);
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (err)
+			goto end_prepare;
+	}
+	for (pair = 0; pair < 2; ++pair) {
+		struct maya_desc *descriptors = m->table + pair * 0x100;
+
+		for (half = 0; half < 2; ++half) {
+			descriptors[half].address =
+				cpu_to_le32(lower_32_bits(c->dma[pair] + half * period * 8));
+			descriptors[half].address_high = 0;
+			descriptors[half].bytes = cpu_to_le32(period * 8);
+			descriptors[half].reserved = 0;
+		}
+		memset(c->ring[pair], 0, frames * 8);
+	}
+	memset(s->runtime->dma_area, 0, frames_to_bytes(s->runtime, frames));
+	dma_wmb();
+
+end_prepare:
+	spin_lock_irqsave(&m->lock, flags);
+	if (!err && (m->fault || m->removing || m->suspended))
+		err = -EIO;
 	if (!err) {
 		c->period = period;
-		c->frames = period * 2;
-		c->position = 0;
-		for (pair = 0; pair < 2; ++pair) {
-			struct maya_desc *descriptors = m->table + pair * 0x100;
-
-			for (half = 0; half < 2; ++half) {
-				descriptors[half].address =
-					cpu_to_le32(lower_32_bits(c->dma[pair] +
-								  half * period * 8));
-				descriptors[half].address_high = 0;
-				descriptors[half].bytes = cpu_to_le32(period * 8);
-				descriptors[half].reserved = 0;
-			}
-			memset(c->ring[pair], 0, c->frames * 8);
-		}
-		memset(s->runtime->dma_area, 0,
-		       c->frames * maya_sample_bytes(s->runtime->format) * 4);
-		dma_wmb();
-		/* Give playback IRQs a scheduling point between input resets. */
-		for (pair = 0; pair < 2; ++pair) {
-			spin_lock_irqsave(&m->lock, flags);
-			err = m->fault || m->removing || m->suspended ?
-				-EIO : maya_capture_rearm(m, pair);
-			spin_unlock_irqrestore(&m->lock, flags);
-			if (err)
-				break;
-		}
+		c->frames = frames;
+		WRITE_ONCE(c->position, 0);
+		for (pair = 0; pair < 2; ++pair)
+			maya_capture_program(m, pair);
 	}
+	c->preparing = false;
+	spin_unlock_irqrestore(&m->lock, flags);
+out:
 	mutex_unlock(&m->codec_lock);
 	return err;
 }
@@ -1335,9 +1445,15 @@ static int maya_capture_trigger(struct snd_pcm_substream *s, int cmd)
 	}
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		if (m->capture.preparing ||
+		    atomic_read(&s->runtime->buffer_accessing) < 0) {
+			err = -EBUSY;
+			break;
+		}
 		err = maya_spdif_capture_check(m, s->runtime->rate);
 		if (err)
 			break;
+		dma_wmb();
 		for (pair = 1; pair >= 0; --pair) {
 			unsigned int b = 0x80 + pair * 0x20;
 
@@ -1499,6 +1615,7 @@ static int maya_ctl_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 	unsigned int pair = k->private_value & 1;
 	unsigned int kind = k->private_value >> 8;
 	long a = v->value.integer.value[0], b = v->value.integer.value[1];
+	unsigned long flags;
 	unsigned int level;
 	bool enabled;
 	int err = 0, changed = 0;
@@ -1515,14 +1632,14 @@ static int maya_ctl_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 		if (m->dac[pair][0] != a) {
 			err = maya_codec_write(m, pair, 3, 0x100 | a);
 			if (err)
-				goto out;
+				goto codec_failed;
 			m->dac[pair][0] = a;
 			changed = 1;
 		}
 		if (m->dac[pair][1] != b) {
 			err = maya_codec_write(m, pair, 4, 0x100 | b);
 			if (err)
-				goto out;
+				goto codec_failed;
 			m->dac[pair][1] = b;
 			changed = 1;
 		}
@@ -1534,7 +1651,7 @@ static int maya_ctl_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 			 */
 			err = maya_codec_write(m, pair, 7, a ? 0x65 : 0x95);
 			if (err)
-				goto out;
+				goto codec_failed;
 			m->dac_swapped[pair] = a;
 		}
 	} else if (kind == CTL_DAC_SWITCH) {
@@ -1547,7 +1664,7 @@ static int maya_ctl_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 					       (m->monitor[pair] &&
 						m->input_enabled[pair] ? 4 : 0));
 			if (err)
-				goto out;
+				goto codec_failed;
 			m->dac_enabled[pair] = a;
 		}
 	} else {
@@ -1558,11 +1675,17 @@ static int maya_ctl_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 			err = maya_codec_write(m, 1 - pair, 2,
 					       0x100 | (enabled ? level + 0x49 : 0));
 			if (err)
-				goto out;
+				goto codec_failed;
 			m->mix[pair] = level;
 			m->mix_enabled[pair] = enabled;
 		}
 	}
+	goto out;
+codec_failed:
+	/* A failed write may already have changed part of the codec state. */
+	spin_lock_irqsave(&m->lock, flags);
+	maya_fatal(m);
+	spin_unlock_irqrestore(&m->lock, flags);
 out:
 	mutex_unlock(&m->codec_lock);
 	return err ? err : changed;
@@ -1613,7 +1736,12 @@ static u16 maya_input_mux(struct maya *m, unsigned int pair)
 	u16 source = m->input_source[pair] == 0 ? 2 :
 		m->input_source[pair] == 1 ? 8 : 0;
 
-	return source | (m->input_enabled[pair] ? 0 : 0xc0);
+	/* The WM8776 PGA mute also gates the analog monitor path. */
+	if (!m->input_enabled[pair] || !m->input_volume[pair][0])
+		source |= BIT(7);
+	if (!m->input_enabled[pair] || !m->input_volume[pair][1])
+		source |= BIT(6);
+	return source;
 }
 
 static int maya_input_levels(struct maya *m, unsigned int pair)
@@ -1622,15 +1750,8 @@ static int maya_input_levels(struct maya *m, unsigned int pair)
 	int err;
 
 	for (ch = 0; ch < 2; ++ch) {
-		unsigned int volume = m->input_volume[pair][ch];
-		unsigned int raw = 62 + volume + m->input_gain[pair];
+		unsigned int raw = 62 + m->input_pga_volume[pair][ch] + m->input_gain[pair];
 
-		/* -infinity is a digital gate in maya_capture_period. Keep the
-		 * last PGA setting there: code 0 causes a bias/settling transient
-		 * on this board when returning to normal gain.
-		 */
-		if (!volume)
-			continue;
 		err = maya_codec_write(m, pair, 14 + ch, 0x100 | raw);
 		if (err)
 			return err;
@@ -1679,7 +1800,7 @@ static int maya_input_get(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 		v->value.integer.value[0] = m->monitor[pair];
 		break;
 	case INPUT_PHANTOM:
-		v->value.integer.value[0] = m->phantom;
+		v->value.integer.value[0] = READ_ONCE(m->phantom);
 		break;
 	}
 	mutex_unlock(&m->codec_lock);
@@ -1709,9 +1830,18 @@ static int maya_input_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 	case INPUT_VOLUME:
 		changed = m->input_volume[pair][0] != a || m->input_volume[pair][1] != b;
 		if (changed) {
-			m->input_volume[pair][0] = a;
-			m->input_volume[pair][1] = b;
+			u16 mux = maya_input_mux(m, pair);
+
+			/* Keep the last usable PGA level while R21 mutes that side. */
+			if (a)
+				m->input_pga_volume[pair][0] = a;
+			if (b)
+				m->input_pga_volume[pair][1] = b;
+			WRITE_ONCE(m->input_volume[pair][0], a);
+			WRITE_ONCE(m->input_volume[pair][1], b);
 			err = maya_input_levels(m, pair);
+			if (!err && mux != maya_input_mux(m, pair))
+				err = maya_codec_write(m, pair, 21, maya_input_mux(m, pair));
 		}
 		break;
 	case INPUT_GAIN:
@@ -1724,7 +1854,7 @@ static int maya_input_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 	case INPUT_SWITCH:
 		changed = m->input_enabled[pair] != a;
 		if (changed) {
-			m->input_enabled[pair] = a;
+			WRITE_ONCE(m->input_enabled[pair], a);
 			err = maya_codec_write(m, pair, 21, maya_input_mux(m, pair));
 			if (!err)
 				err = maya_codec_write(m, pair, 22, (m->dac_enabled[pair] ? 1 : 0) |
@@ -1760,17 +1890,24 @@ static int maya_input_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 		err = maya_codec_write(m, pair, 22, m->dac_enabled[pair] ? 1 : 0);
 		if (err)
 			break;
+		spin_lock_irqsave(&m->lock, flags);
+		if (m->fault || m->removing || m->suspended) {
+			spin_unlock_irqrestore(&m->lock, flags);
+			err = -EIO;
+			goto out;
+		}
 		gpio = mr8(m, 0x481);
 		if (!pair) {
 			gpio = (gpio & 0xaf) | (a == 1 ? 0x10 : 0);
-			m->phantom = false;
+			WRITE_ONCE(m->phantom, false);
 		} else {
 			gpio = (gpio & 0xdf) | (a ? 0 : 0x20);
 		}
 		mw8(m, 0x481, gpio);
 		mw8(m, 0x189, (mr8(m, 0x189) & ~(0x20 << pair)) |
 			(!pair && a == 2 ? 0x20 : 0));
-		m->input_source[pair] = a;
+		WRITE_ONCE(m->input_source[pair], a);
+		spin_unlock_irqrestore(&m->lock, flags);
 		if (!pair && a == 2)
 			m->monitor[0] = false;
 		err = maya_codec_write(m, pair, 21, maya_input_mux(m, pair));
@@ -1785,20 +1922,25 @@ static int maya_input_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 			err = -EINVAL;
 			goto out;
 		}
+		spin_lock_irqsave(&m->lock, flags);
+		if (m->fault || m->removing || m->suspended) {
+			spin_unlock_irqrestore(&m->lock, flags);
+			err = -EIO;
+			goto out;
+		}
 		changed = m->phantom != a;
 		if (changed) {
 			gpio = mr8(m, 0x481);
 			mw8(m, 0x481, (gpio & 0xbf) | (a ? 0x40 : 0));
-			m->phantom = a;
+			WRITE_ONCE(m->phantom, a);
 		}
+		spin_unlock_irqrestore(&m->lock, flags);
 		break;
 	}
 	if (err) {
 		/* A partial codec transaction leaves the actual state uncertain.
 		 * Fail closed: phantom off, all DMA stopped, require module reload.
 		 */
-		mw8(m, 0x481, mr8(m, 0x481) & 0xbf);
-		m->phantom = false;
 		spin_lock_irqsave(&m->lock, flags);
 		maya_fatal(m);
 		spin_unlock_irqrestore(&m->lock, flags);
@@ -2071,11 +2213,8 @@ static void maya_free(struct snd_card *card)
 
 	spin_lock_irqsave(&m->lock, flags);
 	m->removing = true;
-	if (m->enabled) {
-		if (m->io && !m->suspended)
-			mw8(m, 0x481, mr8(m, 0x481) & 0xbf);
+	if (m->enabled)
 		maya_fatal(m);
-	}
 	spin_unlock_irqrestore(&m->lock, flags);
 	cancel_delayed_work_sync(&m->spdif_work);
 	cancel_work_sync(&m->fault_work);
@@ -2115,6 +2254,7 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	struct snd_info_entry *entry;
 	struct maya *m;
 	unsigned int pair, offset;
+	unsigned long flags;
 	int err;
 
 	if (id->driver_data >= ARRAY_SIZE(maya_models))
@@ -2199,6 +2339,8 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		memset(m->capture.ring[pair], 0, MAYA_PAIR_BYTES_MAX);
 		m->input_volume[pair][1] = 145;
 		m->input_volume[pair][0] = 145;
+		m->input_pga_volume[pair][1] = 145;
+		m->input_pga_volume[pair][0] = 145;
 		m->input_enabled[pair] = true;
 		m->mix[pair] = 18; /* -30 dB when explicitly enabled later. */
 	}
@@ -2208,10 +2350,6 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		dev_err(&pci->dev, "controller initialization failed: %d\n", err);
 		goto fail;
 	}
-	err = request_irq(pci->irq, maya_irq, IRQF_SHARED, "snd-maya44e", m);
-	if (err)
-		goto fail;
-	m->irq_requested = true;
 	err = snd_pcm_new(card, model->name, 0, 1, 1, &m->pcm);
 	if (err)
 		goto fail;
@@ -2256,10 +2394,16 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		 model->name,
 		 pci_name(pci),
 		 pci->irq);
+	err = request_irq(pci->irq, maya_irq, IRQF_SHARED, "snd-maya44e", m);
+	if (err)
+		goto fail;
 	pci_set_drvdata(pci, card);
+	spin_lock_irqsave(&m->lock, flags);
+	m->irq_requested = true;
 	m->irq_window = jiffies;
 	pci_set_master(pci);
 	pci_intx(pci, 1);
+	spin_unlock_irqrestore(&m->lock, flags);
 	err = snd_card_register(card);
 	if (err)
 		goto fail;
@@ -2298,8 +2442,7 @@ static int maya_restore_after_sleep(struct maya *m)
 	memset(m->capture.ring[0], 0, MAYA_PAIR_BYTES_MAX);
 	memset(m->capture.ring[1], 0, MAYA_PAIR_BYTES_MAX);
 	maya_configure_buffer(m, m->period_frames);
-	m->last_appl = 0;
-	m->capture.position = 0;
+	WRITE_ONCE(m->capture.position, 0);
 	m->last_pos[1] = 0;
 	m->last_pos[0] = 0;
 	/* A retained rate cache must not suppress clock programming after S3. */
@@ -2311,7 +2454,6 @@ static int maya_restore_after_sleep(struct maya *m)
 	if (err)
 		return err;
 	/* Phantom power is deliberately never automatically re-energized. */
-	m->phantom = false;
 	gpio = mr8(m, 0x481) & ~0x70;
 	gpio |= (m->input_source[0] == 1 ? 0x10 : 0) |
 		(m->input_source[1] ? 0 : 0x20);
@@ -2364,11 +2506,9 @@ static int maya_suspend(struct device *dev)
 	cancel_delayed_work_sync(&m->spdif_work);
 	mutex_lock(&m->codec_lock);
 	spin_lock_irqsave(&m->lock, flags);
-	m->suspend_rate = m->rate;
 	if (!m->suspended) {
-		mw8(m, 0x481, mr8(m, 0x481) & ~0x40);
-		m->phantom = false;
-		maya_quiesce(m);
+		m->suspend_rate = m->rate;
+		maya_quiesce(m, !pci_channel_offline(m->pci));
 		m->suspended = true;
 		m->suspend_count++;
 	}
@@ -2385,12 +2525,19 @@ static int maya_resume(struct device *dev)
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct maya *m = card->private_data;
 	unsigned long flags;
+	bool mmio_active;
 	int err;
 
 	mutex_lock(&m->codec_lock);
 	if (!m->suspended) {
 		mutex_unlock(&m->codec_lock);
 		return 0;
+	}
+	mmio_active = m->pci->current_state == PCI_D0 &&
+		!pci_channel_offline(m->pci) && pci_device_is_present(m->pci);
+	if (!mmio_active) {
+		err = -ENODEV;
+		goto fail;
 	}
 	if (m->fault || m->removing) {
 		err = -EIO;
@@ -2417,9 +2564,13 @@ static int maya_resume(struct device *dev)
 fail:
 	spin_lock_irqsave(&m->lock, flags);
 	m->resume_errors++;
-	maya_fatal(m);
+	m->fault = true;
+	/* PCI can be back in D0 while the software suspend gate is still set. */
+	maya_quiesce(m, mmio_active && !m->removing && !pci_channel_offline(m->pci));
 	spin_unlock_irqrestore(&m->lock, flags);
 	mutex_unlock(&m->codec_lock);
+	/* Wake control operations waiting for D0 on the failed card. */
+	snd_card_disconnect(card);
 	dev_err(dev, "resume failed: %d; DMA and interrupts disabled\n", err);
 	return err;
 }

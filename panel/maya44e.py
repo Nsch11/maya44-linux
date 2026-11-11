@@ -272,11 +272,13 @@ class InputBox(InputPreview):
             self.update_values(self.window.values)
             return
         # Kernel also drops phantom when leaving Mic. Mirror it immediately.
-        if self.pair == 'in12':
+        if self.pair == 'in12' and 'phantom.enabled' in self.window.values:
             self.window.values['phantom.enabled'] = (0,)
         self.window.write(self.pair + '.source', (source,))
 
     def set_phantom(self, on):
+        if 'phantom.enabled' not in self.window.values:
+            return
         if on:
             answer = QMessageBox.question(self.window, translate('Panel', '48 V phantom power'),
                 translate('Panel', 'Enable 48 V on the microphone input? Connect only a microphone that supports phantom power.'),
@@ -335,8 +337,9 @@ class InputBox(InputPreview):
         self.link.setEnabled(not digital)
         self.monitor.setEnabled(not digital and self.window.muted_routes is None)
         if self.phantom is not None:
-            self.phantom.setEnabled(source == 1)
-            self.phantom.setChecked(bool(values['phantom.enabled'][0]))
+            phantom = values.get('phantom.enabled')
+            self.phantom.setEnabled(phantom is not None and source == 1)
+            self.phantom.setChecked(bool(phantom and phantom[0]))
 
 
 class PlaybackBox(Card):
