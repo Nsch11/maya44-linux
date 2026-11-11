@@ -1,0 +1,2 @@
+obj-m += snd-maya44e.o
+snd-maya44e-y := maya44e.o

@@ -1,0 +1,3 @@
+# Filter saved phantom power before the distribution's 90-alsa-restore.rules.
+# PROGRAM runs synchronously; RUN would execute too late, after IMPORT restore.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", DRIVERS=="snd-maya44e", PROGRAM="/usr/local/libexec/maya44e-state"
