@@ -1,3 +1,11 @@
+maya44-linux (0.1.0~alpha.3-1) resolute; urgency=medium
+
+  * Backport PCM, DMA, codec and suspend/resume fixes for stock kernels.
+  * Make phantom power controls optional in the mixer for the analog-only
+    RFC driver.
+
+ -- Nordschamane <129519356+Nsch11@users.noreply.github.com>  Wed, 11 Nov 2026 23:41:27 +0800
+
 maya44-linux (0.1.0~alpha.2-1) resolute; urgency=medium
 
   * Package the experimental driver with DKMS and the Qt mixer for Kubuntu.
