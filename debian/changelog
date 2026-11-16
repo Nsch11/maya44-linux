@@ -1,3 +1,10 @@
+maya44-linux (0.1.0~alpha.4-1) resolute; urgency=medium
+
+  * Backport RFC v4 DMA register checks and capture period tracking.
+  * Exclude PCM copies during prepare and reset using the stock ALSA ioctl.
+
+ -- Nordschamane <129519356+Nsch11@users.noreply.github.com>  Mon, 16 Nov 2026 19:00:36 +0800
+
 maya44-linux (0.1.0~alpha.3-1) resolute; urgency=medium
 
   * Backport PCM, DMA, codec and suspend/resume fixes for stock kernels.
