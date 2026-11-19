@@ -18,11 +18,12 @@ The driver targets these three PCIe models, all with PCI device ID
 `19fe:7000`. Capture tests checked stream continuity with unconnected analog
 inputs. Testing with a known analog input signal is still pending.
 
-In the DKMS driver, playback and capture each use four-channel ALSA PCM and
-share a sample clock. The driver accepts `S16_LE`, `S24_3LE`, `S24_LE` and
-`S32_LE` with 24 significant bits in the last format. The mixer offers 44.1,
-48, 88.2 and 96 kHz and period sizes of 64, 128, 256, 512 or 1024 frames. The
-hardware buffer holds two periods. S/PDIF capture is unavailable at 88.2 kHz.
+From alpha.5, playback and capture use four-channel `S32_LE` with 24
+significant bits and share a sample clock. Direct ALSA clients can use
+`RW_INTERLEAVED` or `MMAP_COMPLEX`. Use PipeWire or the ALSA `plughw` device
+for sample format conversion. The mixer offers 44.1, 48, 88.2 and 96 kHz and
+period sizes of 64, 128, 256, 512 or 1024 frames. The hardware buffer holds
+two periods. S/PDIF capture is unavailable at 88.2 kHz.
 
 The analog-only [MAYA44e RFC v5](https://lore.kernel.org/r/20261120-codex-alsa-maya44e-v5-1-49f3682dfc81@proton.me)
 was submitted to the Linux sound mailing list. It uses the proposed ALSA PCM
@@ -31,8 +32,8 @@ kernels.
 
 ## Install the Kubuntu packages
 
-Download the two `.deb` files from
-[v0.1.0-alpha.4](https://github.com/Nsch11/maya44-linux/releases/tag/v0.1.0-alpha.4).
+Download the matching pair of `.deb` files from
+[GitHub Releases](https://github.com/Nsch11/maya44-linux/releases).
 These packages target Kubuntu 26.04 on amd64. Open a terminal in the download
 directory and run the following commands.
 

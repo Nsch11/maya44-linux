@@ -11,6 +11,7 @@
  * C0 drives playback periods, 80 drives capture periods. S/PDIF replaces
  * input 1/2 and mirrors either output pair; MIDI is not implemented.
  */
+#include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
@@ -23,7 +24,7 @@
 #include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
-#include <linux/unaligned.h>
+#include <linux/uio.h>
 #include <linux/workqueue.h>
 #include <sound/control.h>
 #include <sound/core.h>
@@ -113,78 +114,23 @@ static const struct maya_rate_config *maya_find_rate(unsigned int rate)
 	return NULL;
 }
 
-static unsigned int maya_sample_bytes(snd_pcm_format_t format)
-{
-	switch (format) {
-	case SNDRV_PCM_FORMAT_S16_LE:
-		return 2;
-	case SNDRV_PCM_FORMAT_S24_3LE:
-		return 3;
-	case SNDRV_PCM_FORMAT_S24_LE:
-	case SNDRV_PCM_FORMAT_S32_LE:
-		return 4;
-	default:
-		return 0;
-	}
-}
-
-/* The controller always uses left-aligned 24-bit samples in LE32 words.
- * S24_LE instead stores its 24 significant bits in the low three bytes.
- * Unsigned shifts avoid signed overflow; widening adds zeros, not precision.
- * S32_LE retains the established DMA path; only its top 24 bits reach I2S.
- */
-static inline u32 maya_unpack_sample(const u8 *source, snd_pcm_format_t format)
-{
-	switch (format) {
-	case SNDRV_PCM_FORMAT_S16_LE:
-		return (u32)get_unaligned_le16(source) << 16;
-	case SNDRV_PCM_FORMAT_S24_3LE:
-		return get_unaligned_le24(source) << 8;
-	case SNDRV_PCM_FORMAT_S24_LE:
-		return get_unaligned_le32(source) << 8;
-	case SNDRV_PCM_FORMAT_S32_LE:
-		return get_unaligned_le32(source);
-	default:
-		return 0;
-	}
-}
-
-/* Narrowing discards low bits without dither. Applications can dither before
- * submitting playback or request 24-bit capture and dither in userspace.
- */
-static inline void maya_pack_sample(u8 *target, u32 sample, snd_pcm_format_t format)
-{
-	switch (format) {
-	case SNDRV_PCM_FORMAT_S16_LE:
-		put_unaligned_le16(sample >> 16, target);
-		break;
-	case SNDRV_PCM_FORMAT_S24_3LE:
-		put_unaligned_le24(sample >> 8, target);
-		break;
-	case SNDRV_PCM_FORMAT_S24_LE:
-		/* Sign-extend the nominal 24-bit value into its 32-bit container. */
-		put_unaligned_le32((s32)sample >> 8, target);
-		break;
-	case SNDRV_PCM_FORMAT_S32_LE:
-		put_unaligned_le32(sample, target);
-		break;
-	default:
-		break;
-	}
-}
-
 struct maya_desc {
 	__le32 address, address_high, bytes, reserved;
 };
 
-struct maya_capture {
+struct maya_stream {
 	struct snd_pcm_substream *substream;
+	struct work_struct fault_work;
+};
+
+struct maya_capture {
+	struct maya_stream stream;
 	void *ring[2];
 	dma_addr_t dma[2];
 	bool running, preparing, xrun;
 	unsigned int period, frames, position, dma_position;
 	u64 dma_time_ns, xruns;
-	u64 periods, starts, stops, copied_frames;
+	u64 periods, starts, stops, completed_frames;
 };
 
 struct maya_model {
@@ -198,7 +144,8 @@ struct maya {
 	struct pci_dev *pci;
 	struct snd_card *card;
 	struct snd_pcm *pcm;
-	struct snd_pcm_substream *substream;
+	struct maya_stream playback;
+	struct snd_dma_buffer dma_buffer[2];
 	struct maya_capture capture;
 	unsigned int reserved_rate[2];
 	u8 input_volume[2][2], input_gain[2], input_source[2];
@@ -209,7 +156,6 @@ struct maya {
 	u32 spdif_rx_status;
 	u64 spdif_invalid_periods, spdif_sync_losses;
 	struct delayed_work spdif_work;
-	struct work_struct fault_work;
 	void __iomem *io;
 	/* Protects IRQ/DMA state; may be nested inside codec_lock. */
 	spinlock_t lock;
@@ -224,13 +170,12 @@ struct maya {
 	unsigned int suspend_rate;
 	u64 suspend_count, resume_count, resume_errors;
 	unsigned int rate, period_frames, buffer_frames;
-	snd_pcm_uframes_t last_appl;
 	u8 dac[2][2], mix[2];
 	bool mix_enabled[2], dac_enabled[2];
 	bool dac_swapped[2];
 	u64 irq_total, irq_handled, irq_unhandled, irq_unexpected, periods;
-	u64 ack_calls, copied_frames, pointer_calls, reset_timeouts, codec_timeouts;
-	u64 ack_errors, silence_calls, silence_frames, starts, stops;
+	u64 pointer_calls, reset_timeouts, codec_timeouts;
+	u64 starts, stops;
 	u32 last_summary, last_pos[2];
 	unsigned long irq_window;
 	u32 irq_window_handled;
@@ -413,33 +358,26 @@ static void maya_quiesce(struct maya *m, bool mmio_active)
 
 static void maya_fatal(struct maya *m)
 {
-	bool notify = !m->fault && !m->removing && !m->suspended && m->pcm;
+	bool notify = !m->fault && !m->removing && !m->suspended;
+	bool playback = m->running, capture = m->capture.running;
 
 	WRITE_ONCE(m->fault, true);
 	maya_quiesce(m, !m->suspended);
-	/* Fatal callers can hold stream/device locks. Notify ALSA elsewhere. */
-	if (notify)
-		schedule_work(&m->fault_work);
+	/* Only running streams can need deferred XRUN notification. After STOP,
+	 * no producer can enqueue work for that stream; sync_stop drains it.
+	 */
+	if (notify && playback)
+		schedule_work(&m->playback.fault_work);
+	if (notify && capture)
+		schedule_work(&m->capture.stream.fault_work);
 }
 
-/* Each close clears its pointer under lock, then flushes this work before
- * its runtime can disappear. Flushing rather than cancelling also preserves
- * notification of a still-open peer. No driver lock is held while calling ALSA.
- */
 static void maya_fault_work(struct work_struct *work)
 {
-	struct maya *m = container_of(work, struct maya, fault_work);
-	struct snd_pcm_substream *playback, *capture;
-	unsigned long flags;
+	struct maya_stream *stream = container_of(work, struct maya_stream, fault_work);
 
-	spin_lock_irqsave(&m->lock, flags);
-	playback = m->substream;
-	capture = m->capture.substream;
-	spin_unlock_irqrestore(&m->lock, flags);
-	if (playback)
-		snd_pcm_stop_xrun(playback);
-	if (capture)
-		snd_pcm_stop_xrun(capture);
+	/* close follows sync_stop and cannot clear this pointer until we finish. */
+	snd_pcm_stop_xrun(READ_ONCE(stream->substream));
 }
 
 /* DMA must already be stopped, or probe must have exclusive ownership with
@@ -806,18 +744,15 @@ static int maya_capture_stop(struct maya *m)
 }
 
 /* The 3/4 engine starts first. At a 1/2 boundary both completed stereo
- * halves can be combined. Expose only the half copied to ALSA, never the
- * still-being-written half. Coarse period pointers are intentional.
+ * halves have completed. Publish that period in place after muting the
+ * disabled channels. Coarse period pointers are intentional.
  * Return 1 to notify ALSA, 0 for an early/repeated IRQ, or an MMIO error.
  */
 static int maya_capture_period(struct maya *m)
 {
 	struct maya_capture *c = &m->capture;
-	struct snd_pcm_runtime *runtime = c->substream->runtime;
-	unsigned int sample_bytes = maya_sample_bytes(runtime->format);
-	u8 *dst = runtime->dma_area;
-	__le32 *left = c->ring[0], *right = c->ring[1];
-	unsigned int pos, start, advance, i;
+	struct snd_pcm_runtime *runtime = c->stream.substream->runtime;
+	unsigned int pos, start, advance, i, pair;
 	u64 now, limit;
 	u32 position;
 	bool pass[4];
@@ -869,25 +804,26 @@ static int maya_capture_period(struct maya *m)
 			 READ_ONCE(m->input_volume[i / 2][i % 2]) != 0);
 
 	dma_rmb();
-	for (i = start; i < start + c->period; ++i) {
-		u8 *frame = dst + i * sample_bytes * 4;
+	for (pair = 0; pair < 2; ++pair) {
+		__le32 *samples = c->ring[pair];
+		bool left = pass[pair * 2], right = pass[pair * 2 + 1];
+		unsigned int muted_channel;
 
-		maya_pack_sample(frame, pass[0] ? le32_to_cpu(left[i * 2]) : 0,
-				 runtime->format);
-		maya_pack_sample(frame + sample_bytes,
-				 pass[1] ? le32_to_cpu(left[i * 2 + 1]) : 0,
-				 runtime->format);
-		maya_pack_sample(frame + sample_bytes * 2,
-				 pass[2] ? le32_to_cpu(right[i * 2]) : 0,
-				 runtime->format);
-		maya_pack_sample(frame + sample_bytes * 3,
-				 pass[3] ? le32_to_cpu(right[i * 2 + 1]) : 0,
-				 runtime->format);
+		if (left && right)
+			continue;
+		if (!left && !right) {
+			memset(samples + start * 2, 0, c->period * 8);
+			continue;
+		}
+		muted_channel = left ? 1 : 0;
+		for (i = start; i < start + c->period; ++i)
+			samples[i * 2 + muted_channel] = 0;
 	}
+	dma_wmb();
 	c->position = (start + c->period) % c->frames;
 	c->dma_position = pos;
 	c->dma_time_ns = now;
-	c->copied_frames += c->period;
+	c->completed_frames += c->period;
 	c->periods++;
 	return 1;
 
@@ -960,20 +896,20 @@ static irqreturn_t maya_irq(int irq, void *opaque)
 			goto fatal;
 	}
 	if (capture_tick && m->capture.running && !m->capture.xrun &&
-	    m->capture.substream) {
+	    m->capture.stream.substream) {
 		int ret = maya_capture_period(m);
 
 		if (ret < 0)
 			goto fatal;
 		if (ret)
-			capture = m->capture.substream;
+			capture = m->capture.stream.substream;
 	}
-	if (tick && m->running && m->substream) {
+	if (tick && m->running && m->playback.substream) {
 		if (maya_read32(m, 0xc4, &m->last_pos[0]) ||
 		    maya_read32(m, 0xe4, &m->last_pos[1]))
 			goto fatal;
 		m->periods++;
-		substream = m->substream;
+		substream = m->playback.substream;
 	}
 	goto unlock;
 fatal:
@@ -997,10 +933,9 @@ unlock:
 static const struct snd_pcm_hardware maya_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-		SNDRV_PCM_INFO_SYNC_APPLPTR | SNDRV_PCM_INFO_NO_REWINDS |
+		SNDRV_PCM_INFO_COMPLEX | SNDRV_PCM_INFO_NO_REWINDS |
 		SNDRV_PCM_INFO_JOINT_DUPLEX,
-	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_3LE |
-		SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE,
+	.formats = SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_8000_48000 | SNDRV_PCM_RATE_24000 |
 		SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000,
 	.rate_min = 8000, .rate_max = 96000,
@@ -1018,39 +953,38 @@ static int maya_hw_params(struct snd_pcm_substream *s, struct snd_pcm_hw_params 
 {
 	struct maya *m = snd_pcm_substream_chip(s);
 	unsigned int direction = s->stream;
-	int err = 0;
+	struct snd_dma_buffer *buffer = &m->dma_buffer[direction];
 
-	mutex_lock(&m->codec_lock);
+	guard(mutex)(&m->codec_lock);
 	if (m->reserved_rate[1 - direction] &&
 	    m->reserved_rate[1 - direction] != params_rate(p))
-		err = -EBUSY;
-	else
-		m->reserved_rate[direction] = params_rate(p);
-	mutex_unlock(&m->codec_lock);
-	return err;
+		return -EBUSY;
+
+	/* With a custom .copy, ALSA leaves the mmap buffer clearing to us. */
+	memset(buffer->area, 0, buffer->bytes);
+	m->reserved_rate[direction] = params_rate(p);
+	return 0;
 }
 
 static int maya_hw_free(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
 
-	mutex_lock(&m->codec_lock);
+	guard(mutex)(&m->codec_lock);
 	m->reserved_rate[s->stream] = 0;
-	mutex_unlock(&m->codec_lock);
 	return 0;
 }
 
 static int maya_rate_rule(struct snd_pcm_hw_params *params,
-			 struct snd_pcm_hw_rule *rule)
+			  struct snd_pcm_hw_rule *rule)
 {
 	struct snd_pcm_substream *s = rule->private;
 	struct maya *m = snd_pcm_substream_chip(s);
 	struct snd_interval limit = { .integer = 1 };
 	unsigned int rate;
 
-	mutex_lock(&m->codec_lock);
+	guard(mutex)(&m->codec_lock);
 	rate = m->reserved_rate[1 - s->stream];
-	mutex_unlock(&m->codec_lock);
 	if (!rate)
 		return 0;
 
@@ -1065,6 +999,11 @@ static int maya_pcm_constraints(struct snd_pcm_substream *s)
 	struct snd_pcm_runtime *r = s->runtime;
 	int err;
 
+	err = snd_pcm_hw_constraint_mask64(r, SNDRV_PCM_HW_PARAM_ACCESS,
+					   BIT_ULL(SNDRV_PCM_ACCESS_RW_INTERLEAVED) |
+					   BIT_ULL(SNDRV_PCM_ACCESS_MMAP_COMPLEX));
+	if (err < 0)
+		return err;
 	err = snd_pcm_hw_constraint_integer(r, SNDRV_PCM_HW_PARAM_PERIODS);
 	if (err < 0)
 		return err;
@@ -1083,7 +1022,6 @@ static int maya_pcm_constraints(struct snd_pcm_substream *s)
 static int maya_open(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
-	unsigned long flags;
 	int err;
 
 	if (READ_ONCE(m->fault) || READ_ONCE(m->removing) || READ_ONCE(m->suspended))
@@ -1104,62 +1042,46 @@ static int maya_open(struct snd_pcm_substream *s)
 	err = maya_pcm_constraints(s);
 	if (err < 0)
 		return err;
-	spin_lock_irqsave(&m->lock, flags);
-	m->substream = s;
-	spin_unlock_irqrestore(&m->lock, flags);
+	guard(spinlock_irqsave)(&m->lock);
+	snd_pcm_set_runtime_buffer(s, &m->dma_buffer[SNDRV_PCM_STREAM_PLAYBACK]);
+	m->playback.substream = s;
 	return 0;
 }
 
 static int maya_close(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
-	unsigned long flags;
 
-	spin_lock_irqsave(&m->lock, flags);
-	if (m->running)
-		maya_stop(m);
-	m->substream = NULL;
-	spin_unlock_irqrestore(&m->lock, flags);
-	flush_work(&m->fault_work);
-	synchronize_irq(m->pci->irq);
+	guard(spinlock_irqsave)(&m->lock);
+	WRITE_ONCE(m->playback.substream, NULL);
 	return 0;
 }
 
-static int maya_pcm_ioctl(struct snd_pcm_substream *s, unsigned int cmd, void *arg)
+static int maya_pcm_reset_legacy(struct snd_pcm_substream *s, void *arg)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
 	struct snd_pcm_runtime *runtime = s->runtime;
 	bool capture = s->stream == SNDRV_PCM_STREAM_CAPTURE;
 	bool preparing;
-	unsigned long flags;
 	int err;
 
-	if (cmd != SNDRV_PCM_IOCTL1_RESET)
-		return snd_pcm_lib_ioctl(s, cmd, arg);
-
-	spin_lock_irqsave(&m->lock, flags);
-	preparing = capture ? m->capture.preparing : m->playback_preparing;
-	spin_unlock_irqrestore(&m->lock, flags);
+	scoped_guard(spinlock_irqsave, &m->lock)
+		preparing = capture ? m->capture.preparing : m->playback_preparing;
 	if (!preparing && !atomic_dec_unless_positive(&runtime->buffer_accessing))
 		return -EBUSY;
 
-	err = snd_pcm_lib_ioctl(s, cmd, arg);
-	/* Stock ALSA rebases appl_ptr in a later action. Keep copies out of
-	 * the reset callback, and set last_appl from the same hw_ptr here.
+	err = snd_pcm_lib_ioctl(s, SNDRV_PCM_IOCTL1_RESET, arg);
+	/* Stock ALSA completes the pointer rebase after this ioctl. Clearing
+	 * the rings here is safe before START, while the copy gate is held.
 	 */
-	snd_pcm_stream_lock_irqsave(s, flags);
-	spin_lock(&m->lock);
+	guard(pcm_stream_lock_irqsave)(s);
+	guard(spinlock)(&m->lock);
 	if (!err && (m->fault || m->removing || m->suspended))
 		err = -EIO;
-	if (!err && !capture) {
-		if (preparing) {
-			memset(m->ring[0], 0, m->buffer_frames * 8);
-			memset(m->ring[1], 0, m->buffer_frames * 8);
-			memset(runtime->dma_area, 0,
-			       frames_to_bytes(runtime, runtime->buffer_size));
-			dma_wmb();
-		}
-		m->last_appl = runtime->status->hw_ptr;
+	if (!err && !capture && preparing) {
+		memset(m->ring[0], 0, m->buffer_frames * 8);
+		memset(m->ring[1], 0, m->buffer_frames * 8);
+		dma_wmb();
 	}
 	if (preparing) {
 		if (capture)
@@ -1167,10 +1089,27 @@ static int maya_pcm_ioctl(struct snd_pcm_substream *s, unsigned int cmd, void *a
 		else
 			m->playback_preparing = false;
 	}
-	spin_unlock(&m->lock);
 	atomic_inc(&runtime->buffer_accessing);
-	snd_pcm_stream_unlock_irqrestore(s, flags);
 	return err;
+}
+
+static int maya_pcm_ioctl(struct snd_pcm_substream *s, unsigned int cmd, void *arg)
+{
+	struct snd_pcm_channel_info *info;
+
+	if (cmd == SNDRV_PCM_IOCTL1_RESET)
+		return maya_pcm_reset_legacy(s, arg);
+	if (cmd != SNDRV_PCM_IOCTL1_CHANNEL_INFO)
+		return snd_pcm_lib_ioctl(s, cmd, arg);
+	info = arg;
+	if (info->channel >= 4)
+		return -EINVAL;
+	/* Both rings share one mapping, including on 64 KiB-page kernels. */
+	info->offset = 0;
+	info->first = (info->channel / 2) * MAYA_PAIR_BYTES_MAX * 8 +
+		      (info->channel % 2) * 32;
+	info->step = 64;
+	return 0;
 }
 
 /* codec_lock held. The immutable diagnostic mode excludes ALSA capture.
@@ -1184,7 +1123,7 @@ static int maya_prepare_diagnostic_inputs(struct maya *m)
 	int err;
 
 	m->diagnostic_inputs_ready = false;
-	if (c->substream || c->running || m->reserved_rate[1])
+	if (c->stream.substream || c->running || m->reserved_rate[1])
 		return -EBUSY;
 	if (!maya_valid_period(m->period_frames) || m->rate < 32000)
 		return -EINVAL;
@@ -1236,7 +1175,7 @@ static int maya_prepare(struct snd_pcm_substream *s)
 	unsigned long flags;
 	int err;
 
-	if (!maya_sample_bytes(s->runtime->format) ||
+	if (s->runtime->format != SNDRV_PCM_FORMAT_S32_LE ||
 	    !maya_valid_period(s->runtime->period_size) ||
 	    s->runtime->buffer_size != s->runtime->period_size * 2 ||
 	    !maya_find_rate(s->runtime->rate) ||
@@ -1356,8 +1295,17 @@ static int maya_trigger(struct snd_pcm_substream *s, int command)
 static int maya_sync_stop(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
+	struct maya_stream *stream = s->stream == SNDRV_PCM_STREAM_PLAYBACK ?
+		&m->playback : &m->capture.stream;
 
+	/* Trigger has stopped this direction under m->lock. Complete any IRQ
+	 * and the matching XRUN work before hw_free or close can release it.
+	 * Do not hold a PCM, codec or register lock while waiting.
+	 */
 	synchronize_irq(m->pci->irq);
+	if (s->stream == SNDRV_PCM_STREAM_CAPTURE)
+		cancel_delayed_work_sync(&m->spdif_work);
+	flush_work(&stream->fault_work);
 	return 0;
 }
 
@@ -1388,94 +1336,78 @@ static snd_pcm_uframes_t maya_pointer(struct snd_pcm_substream *s)
 	return (position >> 3) % frames;
 }
 
-/* ALSA calls ack after committing appl_ptr, under its stream lock. Explicit
- * appl_ptr synchronization is mandatory because the mmap staging buffer is
- * not the controller's pair-interleaved DMA layout. Rewinds are disabled.
+/* Read/write clients use four interleaved channels. Move intact stereo
+ * frames between that layout and the native rings outside the stream lock.
  */
-static int maya_ack(struct snd_pcm_substream *s)
+static int maya_pcm_copy(struct snd_pcm_substream *s, int channel,
+			 unsigned long position, struct iov_iter *iter, unsigned long bytes)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
-	struct snd_pcm_runtime *r = s->runtime;
-	__le32 *out12 = m->ring[0], *out34 = m->ring[1];
-	snd_pcm_uframes_t appl, frame;
-	snd_pcm_sframes_t count;
-	unsigned int sample_bytes;
-	int err = 0;
+	bool playback = s->stream == SNDRV_PCM_STREAM_PLAYBACK;
+	__le64 *left = playback ? m->ring[0] : m->capture.ring[0];
+	__le64 *right = playback ? m->ring[1] : m->capture.ring[1];
+	unsigned long ring_bytes = frames_to_bytes(s->runtime, s->runtime->buffer_size);
+	unsigned long offset = position / 16;
+	__le64 frames[32][2];
 
-	if (READ_ONCE(m->fault) || READ_ONCE(m->removing) || READ_ONCE(m->suspended)) {
-		m->ack_errors++;
+	if (channel || position % 16 || bytes % 16 || position > ring_bytes ||
+	    bytes > ring_bytes - position)
+		return -EINVAL;
+	if (READ_ONCE(m->fault) || READ_ONCE(m->removing) || READ_ONCE(m->suspended))
 		return -EIO;
-	}
-	/* SYNC_PTR can call ack without pinning the managed PCM buffer. */
-	if (!atomic_inc_unless_negative(&r->buffer_accessing)) {
-		m->ack_errors++;
-		return -EBUSY;
-	}
-	if (!r->dma_area || !r->buffer_size || r->state == SNDRV_PCM_STATE_SETUP) {
-		err = -EBADFD;
-		goto out;
-	}
-	sample_bytes = maya_sample_bytes(r->format);
-	if (!sample_bytes) {
-		err = -EINVAL;
-		goto out;
-	}
-	appl = READ_ONCE(r->control->appl_ptr);
-	count = appl - m->last_appl;
-	if (count < 0)
-		count += r->boundary;
-	if (count < 0 || count > (snd_pcm_sframes_t)r->buffer_size) {
-		dev_err_ratelimited(&m->pci->dev,
-				    "invalid appl_ptr delta=%ld old=%lu new=%lu boundary=%lu\n",
-				    count, m->last_appl, appl, r->boundary);
-		err = -EINVAL;
-		goto out;
-	}
-	for (frame = 0; frame < (snd_pcm_uframes_t)count; ++frame) {
-		unsigned int slot = (m->last_appl + frame) % r->buffer_size;
-		const u8 *source = r->dma_area + slot * sample_bytes * 4;
+	if (!playback)
+		dma_rmb();
+	while (bytes) {
+		unsigned int count = min_t(unsigned long, bytes / 16, ARRAY_SIZE(frames));
+		unsigned int i, chunk = count * 16;
 
-		out12[slot * 2] = cpu_to_le32(maya_unpack_sample(source, r->format));
-		out12[slot * 2 + 1] =
-			cpu_to_le32(maya_unpack_sample(source + sample_bytes, r->format));
-		out34[slot * 2] =
-			cpu_to_le32(maya_unpack_sample(source + sample_bytes * 2, r->format));
-		out34[slot * 2 + 1] =
-			cpu_to_le32(maya_unpack_sample(source + sample_bytes * 3, r->format));
+		if (playback) {
+			if (copy_from_iter(frames, chunk, iter) != chunk)
+				return -EFAULT;
+			for (i = 0; i < count; ++i) {
+				left[offset + i] = frames[i][0];
+				right[offset + i] = frames[i][1];
+			}
+		} else {
+			for (i = 0; i < count; ++i) {
+				frames[i][0] = left[offset + i];
+				frames[i][1] = right[offset + i];
+			}
+			if (copy_to_iter(frames, chunk, iter) != chunk)
+				return -EFAULT;
+		}
+		offset += count;
+		bytes -= chunk;
 	}
-	dma_wmb();
-	WRITE_ONCE(m->last_appl, appl);
-	m->ack_calls++;
-	m->copied_frames += count;
-out:
-	atomic_dec(&r->buffer_accessing);
-	if (err)
-		m->ack_errors++;
-	return err;
+	if (playback)
+		dma_wmb();
+	return 0;
 }
 
 static int maya_fill_silence(struct snd_pcm_substream *s, int channel,
 			     unsigned long position, unsigned long bytes)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
-	unsigned int frame_bytes = maya_sample_bytes(s->runtime->format) * 4;
-	unsigned long ring_bytes = s->runtime->buffer_size * frame_bytes;
-	unsigned long dma_position, dma_bytes;
+	unsigned long ring_bytes = frames_to_bytes(s->runtime, s->runtime->buffer_size);
 
-	(void)channel; /* Only four-channel interleaved PCM is exposed. */
-	/* The ALSA core splits the request at the logical ring end. */
-	if (!frame_bytes || position % frame_bytes || bytes % frame_bytes ||
-	    position > ring_bytes ||
-	    bytes > ring_bytes - position)
-		return -EINVAL;
-	dma_position = position / frame_bytes * 8;
-	dma_bytes = bytes / frame_bytes * 8;
-	memset(s->runtime->dma_area + position, 0, bytes);
-	memset(m->ring[0] + dma_position, 0, dma_bytes);
-	memset(m->ring[1] + dma_position, 0, dma_bytes);
+	if (s->runtime->access == SNDRV_PCM_ACCESS_MMAP_COMPLEX) {
+		__le32 *samples;
+		unsigned long i;
+
+		if (channel < 0 || channel >= 4 || position % 4 || bytes % 4 ||
+		    position > ring_bytes / 4 || bytes > ring_bytes / 4 - position)
+			return -EINVAL;
+		samples = m->ring[channel / 2];
+		for (i = position / 4; i < (position + bytes) / 4; ++i)
+			samples[i * 2 + channel % 2] = 0;
+	} else {
+		if (channel || position % 16 || bytes % 16 || position > ring_bytes ||
+		    bytes > ring_bytes - position)
+			return -EINVAL;
+		memset(m->ring[0] + position / 2, 0, bytes / 2);
+		memset(m->ring[1] + position / 2, 0, bytes / 2);
+	}
 	dma_wmb();
-	m->silence_calls++;
-	m->silence_frames += bytes / frame_bytes;
 	return 0;
 }
 
@@ -1489,14 +1421,13 @@ static const struct snd_pcm_ops maya_pcm_ops = {
 	.trigger = maya_trigger,
 	.sync_stop = maya_sync_stop,
 	.pointer = maya_pointer,
-	.ack = maya_ack,
+	.copy = maya_pcm_copy,
 	.fill_silence = maya_fill_silence,
 };
 
 static int maya_capture_open(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
-	unsigned long flags;
 	int err;
 
 	if (diagnostic_four_dma)
@@ -1504,6 +1435,7 @@ static int maya_capture_open(struct snd_pcm_substream *s)
 	if (READ_ONCE(m->fault) || READ_ONCE(m->removing) || READ_ONCE(m->suspended))
 		return -EIO;
 	s->runtime->hw = maya_pcm_hardware;
+	s->runtime->hw.info |= SNDRV_PCM_INFO_BATCH;
 	/* ADC datasheet rates start at 32 kHz; lower controller rates are not
 	 * yet validated for capture. Do not advertise unsupported ADC clocks.
 	 */
@@ -1522,25 +1454,18 @@ static int maya_capture_open(struct snd_pcm_substream *s)
 	err = maya_pcm_constraints(s);
 	if (err < 0)
 		return err;
-	spin_lock_irqsave(&m->lock, flags);
-	m->capture.substream = s;
-	spin_unlock_irqrestore(&m->lock, flags);
+	guard(spinlock_irqsave)(&m->lock);
+	snd_pcm_set_runtime_buffer(s, &m->dma_buffer[SNDRV_PCM_STREAM_CAPTURE]);
+	m->capture.stream.substream = s;
 	return 0;
 }
 
 static int maya_capture_close(struct snd_pcm_substream *s)
 {
 	struct maya *m = snd_pcm_substream_chip(s);
-	unsigned long flags;
 
-	cancel_delayed_work_sync(&m->spdif_work);
-	spin_lock_irqsave(&m->lock, flags);
-	if (m->capture.running)
-		maya_capture_stop(m);
-	m->capture.substream = NULL;
-	spin_unlock_irqrestore(&m->lock, flags);
-	flush_work(&m->fault_work);
-	synchronize_irq(m->pci->irq);
+	guard(spinlock_irqsave)(&m->lock);
+	WRITE_ONCE(m->capture.stream.substream, NULL);
 	return 0;
 }
 
@@ -1555,7 +1480,7 @@ static int maya_capture_prepare(struct snd_pcm_substream *s)
 
 	if (diagnostic_four_dma)
 		return -EBUSY;
-	if (!maya_sample_bytes(s->runtime->format) ||
+	if (s->runtime->format != SNDRV_PCM_FORMAT_S32_LE ||
 	    !maya_valid_period(period) || s->runtime->buffer_size != period * 2 ||
 	    s->runtime->rate < 32000 || !maya_find_rate(s->runtime->rate))
 		return -EINVAL;
@@ -1604,7 +1529,6 @@ static int maya_capture_prepare(struct snd_pcm_substream *s)
 		}
 		memset(c->ring[pair], 0, frames * 8);
 	}
-	memset(s->runtime->dma_area, 0, frames_to_bytes(s->runtime, frames));
 	dma_wmb();
 
 end_prepare:
@@ -1707,16 +1631,17 @@ static const struct snd_pcm_ops maya_capture_ops = {
 	.trigger = maya_capture_trigger,
 	.sync_stop = maya_sync_stop,
 	.pointer = maya_capture_pointer,
+	.copy = maya_pcm_copy,
 };
 
 /* A disconnected digital clock may stop capture IRQs altogether. Poll its
  * status independently and report capture XRUN without stopping playback.
- * close/free cancel synchronously before the substream can disappear.
+ * sync_stop/free cancel synchronously before the substream can disappear.
  */
 static void maya_spdif_watchdog(struct work_struct *work)
 {
 	struct maya *m = container_of(to_delayed_work(work), struct maya, spdif_work);
-	struct snd_pcm_substream *s = READ_ONCE(m->capture.substream);
+	struct snd_pcm_substream *s = READ_ONCE(m->capture.stream.substream);
 	unsigned long stream_flags, flags;
 	bool lost = false, again = false;
 
@@ -2398,10 +2323,7 @@ static void maya_status(struct snd_info_entry *entry, struct snd_info_buffer *bu
 	spin_unlock_irqrestore(&m->lock, flags);
 	snd_iprintf(buffer, "experimental analog-duplex %u Hz S32_LE 4 channels\n",
 		    READ_ONCE(m->rate));
-	/* The first line retains the fixed DMA/codec contract for older panels.
-	 * Active ALSA staging format is available in pcm0[pc]/sub0/hw_params.
-	 */
-	snd_iprintf(buffer, "pcm_formats=S16_LE,S24_3LE,S24_LE,S32_LE dac_bits=24\n");
+	snd_iprintf(buffer, "pcm_formats=S32_LE dac_bits=24\n");
 	snd_iprintf(buffer, "model=%s hardware_validation=%s\n", m->model->name,
 		    m->model->hardware_untested ? "untested" : "partial");
 	snd_iprintf(buffer, "rate_mode=%s\n",
@@ -2421,11 +2343,11 @@ static void maya_status(struct snd_info_entry *entry, struct snd_info_buffer *bu
 		    READ_ONCE(m->fault),
 		    READ_ONCE(m->removing));
 	snd_iprintf(buffer,
-		    "capture_running=%u capture_period_frames=%u capture_buffer_frames=%u capture_position=%u capture_periods=%llu capture_copied_frames=%llu capture_starts=%llu capture_stops=%llu\n",
+		    "capture_running=%u capture_period_frames=%u capture_buffer_frames=%u capture_position=%u capture_periods=%llu capture_completed_frames=%llu capture_starts=%llu capture_stops=%llu\n",
 
 		READ_ONCE(m->capture.running), READ_ONCE(m->capture.period),
 		READ_ONCE(m->capture.frames), READ_ONCE(m->capture.position),
-		READ_ONCE(m->capture.periods), READ_ONCE(m->capture.copied_frames),
+		READ_ONCE(m->capture.periods), READ_ONCE(m->capture.completed_frames),
 		READ_ONCE(m->capture.starts), READ_ONCE(m->capture.stops));
 	snd_iprintf(buffer, "capture_dma_xruns=%llu mmio_lost=%u\n",
 		    READ_ONCE(m->capture.xruns), READ_ONCE(m->mmio_lost));
@@ -2454,18 +2376,9 @@ static void maya_status(struct snd_info_entry *entry, struct snd_info_buffer *bu
 		    position0,
 		    position1,
 		    summary);
-	snd_iprintf(buffer, "pointer_calls=%llu ack_calls=%llu copied_frames=%llu last_appl=%lu\n",
-		    READ_ONCE(m->pointer_calls),
-		    READ_ONCE(m->ack_calls),
-		    READ_ONCE(m->copied_frames),
-		    READ_ONCE(m->last_appl));
-	snd_iprintf(buffer,
-		    "starts=%llu stops=%llu ack_errors=%llu silence_calls=%llu silence_frames=%llu\n",
-		    READ_ONCE(m->starts),
-		    READ_ONCE(m->stops),
-		    READ_ONCE(m->ack_errors),
-		    READ_ONCE(m->silence_calls),
-		    READ_ONCE(m->silence_frames));
+	snd_iprintf(buffer, "pointer_calls=%llu starts=%llu stops=%llu\n",
+		    READ_ONCE(m->pointer_calls), READ_ONCE(m->starts),
+		    READ_ONCE(m->stops));
 	snd_iprintf(buffer, "reset_timeouts=%llu codec_timeouts=%llu\n",
 		    READ_ONCE(m->reset_timeouts),
 		    READ_ONCE(m->codec_timeouts));
@@ -2483,19 +2396,15 @@ static void maya_free(struct snd_card *card)
 		maya_fatal(m);
 	spin_unlock_irqrestore(&m->lock, flags);
 	cancel_delayed_work_sync(&m->spdif_work);
-	cancel_work_sync(&m->fault_work);
+	cancel_work_sync(&m->playback.fault_work);
+	cancel_work_sync(&m->capture.stream.fault_work);
 	if (m->irq_requested)
 		free_irq(m->pci->irq, m);
 	if (m->enabled)
 		pci_wait_for_pending_transaction(m->pci);
 	for (pair = 0; pair < 2; ++pair)
-		if (m->capture.ring[pair])
-			dma_free_coherent(&m->pci->dev, MAYA_PAIR_BYTES_MAX,
-					  m->capture.ring[pair], m->capture.dma[pair]);
-	for (pair = 0; pair < 2; ++pair)
-		if (m->ring[pair])
-			dma_free_coherent(&m->pci->dev, MAYA_PAIR_BYTES_MAX,
-					  m->ring[pair], m->ring_dma[pair]);
+		if (m->dma_buffer[pair].area)
+			snd_dma_free_pages(&m->dma_buffer[pair]);
 	if (m->desc_allocation)
 		dma_free_coherent(&m->pci->dev, MAYA_DESC_BYTES,
 				  m->desc_allocation, m->desc_dma);
@@ -2549,7 +2458,8 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	m->buffer_frames = MAYA_DEFAULT_PERIOD * 2;
 	m->spdif_enabled = true;
 	INIT_DELAYED_WORK(&m->spdif_work, maya_spdif_watchdog);
-	INIT_WORK(&m->fault_work, maya_fault_work);
+	INIT_WORK(&m->playback.fault_work, maya_fault_work);
+	INIT_WORK(&m->capture.stream.fault_work, maya_fault_work);
 	spin_lock_init(&m->lock);
 	mutex_init(&m->codec_lock);
 	card->private_free = maya_free;
@@ -2586,23 +2496,24 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	offset = m->table_dma - m->desc_dma;
 	m->table = m->desc_allocation + offset;
 	for (pair = 0; pair < 2; ++pair) {
-		m->ring[pair] = dma_alloc_coherent(&pci->dev, MAYA_PAIR_BYTES_MAX,
-						   &m->ring_dma[pair], GFP_KERNEL);
-		if (!m->ring[pair]) {
-			err = -ENOMEM;
+		err = snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV, &pci->dev,
+					  MAYA_PCM_BYTES_MAX, &m->dma_buffer[pair]);
+		if (err)
 			goto fail;
-		}
-		memset(m->ring[pair], 0, MAYA_PAIR_BYTES_MAX);
+		memset(m->dma_buffer[pair].area, 0, MAYA_PCM_BYTES_MAX);
+	}
+	for (pair = 0; pair < 2; ++pair) {
+		unsigned int offset = pair * MAYA_PAIR_BYTES_MAX;
+		struct snd_dma_buffer *playback = &m->dma_buffer[SNDRV_PCM_STREAM_PLAYBACK];
+		struct snd_dma_buffer *capture = &m->dma_buffer[SNDRV_PCM_STREAM_CAPTURE];
+
+		m->ring[pair] = playback->area + offset;
+		m->ring_dma[pair] = playback->addr + offset;
+		m->capture.ring[pair] = capture->area + offset;
+		m->capture.dma[pair] = capture->addr + offset;
 		m->dac[pair][1] = 0xc3;
 		m->dac[pair][0] = 0xc3;
 		m->dac_enabled[pair] = true; /* Matches the initial R22=1. */
-		m->capture.ring[pair] = dma_alloc_coherent(&pci->dev, MAYA_PAIR_BYTES_MAX,
-							   &m->capture.dma[pair], GFP_KERNEL);
-		if (!m->capture.ring[pair]) {
-			err = -ENOMEM;
-			goto fail;
-		}
-		memset(m->capture.ring[pair], 0, MAYA_PAIR_BYTES_MAX);
 		m->input_volume[pair][1] = 145;
 		m->input_volume[pair][0] = 145;
 		m->input_pga_volume[pair][1] = 145;
@@ -2623,10 +2534,6 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	snprintf(m->pcm->name, sizeof(m->pcm->name), "%s 4-channel PCM", model->name);
 	snd_pcm_set_ops(m->pcm, SNDRV_PCM_STREAM_PLAYBACK, &maya_pcm_ops);
 	snd_pcm_set_ops(m->pcm, SNDRV_PCM_STREAM_CAPTURE, &maya_capture_ops);
-	err = snd_pcm_set_managed_buffer_all(m->pcm, SNDRV_DMA_TYPE_VMALLOC,
-					     NULL, MAYA_PCM_BYTES_MAX, MAYA_PCM_BYTES_MAX);
-	if (err)
-		goto fail;
 	for (pair = 0; pair < ARRAY_SIZE(maya_controls); ++pair) {
 		err = snd_ctl_add(card, snd_ctl_new1(&maya_controls[pair], m));
 		if (err)
@@ -2678,7 +2585,7 @@ static int maya_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	err = snd_card_register(card);
 	if (err)
 		goto fail;
-	dev_info(&pci->dev, "experimental analog duplex ready: 4ch S16/S24/S32_LE, initial %u Hz (%s), periods 64/128/256/512/1024 (initial %u), outputs -30dB, crossmix off\n",
+	dev_info(&pci->dev, "experimental analog duplex ready: 4ch S32_LE, initial %u Hz (%s), periods 64/128/256/512/1024 (initial %u), outputs -30dB, crossmix off\n",
 		 m->rate, diagnostic_rate ? "fixed" : "PCM-negotiated", m->period_frames);
 	return 0;
 fail:
@@ -2794,7 +2701,8 @@ static int maya_suspend(struct device *dev)
 	synchronize_irq(m->pci->irq);
 	mutex_unlock(&m->codec_lock);
 	/* The gate prevents new work; complete any pending peer notification. */
-	flush_work(&m->fault_work);
+	flush_work(&m->playback.fault_work);
+	flush_work(&m->capture.stream.fault_work);
 	return 0;
 }
 

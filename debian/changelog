@@ -1,3 +1,11 @@
+maya44-linux (0.1.0~alpha.5-1) resolute; urgency=medium
+
+  * Map native stereo DMA rings and advertise BATCH for capture.
+  * Clear the whole PCM allocation before exposing it to a new client.
+  * Drain per-stream fault work in sync_stop and use the stock ALSA RESET ioctl.
+
+ -- Nordschamane <129519356+Nsch11@users.noreply.github.com>  Fri, 20 Nov 2026 01:18:03 +0800
+
 maya44-linux (0.1.0~alpha.4-1) resolute; urgency=medium
 
   * Backport RFC v4 DMA register checks and capture period tracking.
