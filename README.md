@@ -125,8 +125,9 @@ works independently of the two stereo devices.
 ## Known limits and test reports
 
 - External S/PDIF is awaiting hardware testing. The internal loopback was tested.
-- One MAYA44e had a faint left-channel whine on output 3/4 under both Linux
-  and Windows. The owner found it much less audible at 88.2 or 96 kHz.
+- On the tested MAYA44e, a faint whine was audible in the left channel of
+  output 3/4 under both Linux and Windows. It was much less noticeable at
+  88.2 or 96 kHz.
 - If you hear dropouts at small periods, try 512 frames as a baseline.
 - Reports from XTe and eX owners are welcome. Include the card's PCI ID
   (`lspci -nn -d 19fe:7000`), kernel version, sample rate, period size, and
