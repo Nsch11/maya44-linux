@@ -10,35 +10,41 @@ translations, light and dark themes, live meters, and analog and S/PDIF controls
 
 | Card | PCI subsystem ID | Status |
 | --- | --- | --- |
-| MAYA44e | `0e51:0001` | Analog playback, capture, duplex, MIX and suspend/resume exercised on one card |
-| MAYA44 XTe | `0e51:0002` | Experimental profile. Hardware testing wanted |
-| MAYA44 eX | `0e51:0003` | Experimental profile. Hardware testing wanted |
+| MAYA44e | `0e51:0001` | Tested on one card for analog playback, four-channel capture, duplex, MIX and suspend/resume |
+| MAYA44 XTe | `0e51:0002` | Experimental. Hardware testing pending |
+| MAYA44 eX | `0e51:0003` | Experimental. Hardware testing pending |
 
-All three profiles match PCI device `19fe:7000` and use the same driver. The PCI
-MAYA44 and the MAYA44 USB are different devices.
+The driver targets these three PCIe models, all with PCI device ID
+`19fe:7000`. Capture tests checked stream continuity with unconnected analog
+inputs. Testing with a known analog input signal is still pending.
 
-Both directions use four-channel ALSA PCM with a shared sample clock. PCM
-formats are `S16_LE`, `S24_3LE`, `S24_LE` and `S32_LE`. The last format
-has 24 significant bits. The mixer offers 44.1, 48, 88.2 and 96 kHz and period
-sizes of 64, 128, 256, 512 or 1024 frames. The hardware PCM buffer uses two
-periods.
+In the DKMS driver, playback and capture each use four-channel ALSA PCM and
+share a sample clock. The driver accepts `S16_LE`, `S24_3LE`, `S24_LE` and
+`S32_LE` with 24 significant bits in the last format. The mixer offers 44.1,
+48, 88.2 and 96 kHz and period sizes of 64, 128, 256, 512 or 1024 frames. The
+hardware buffer holds two periods. S/PDIF capture is unavailable at 88.2 kHz.
+
+The analog-only [MAYA44e RFC v5](https://lore.kernel.org/r/20261120-codex-alsa-maya44e-v5-1-49f3682dfc81@proton.me)
+was submitted to the Linux sound mailing list. It uses the proposed ALSA PCM
+reset operation. The GitHub packages use the PCM interface in stock Kubuntu
+kernels.
 
 ## Install the Kubuntu packages
 
-The test packages target Kubuntu 26.04 on amd64. Put the two downloads in
-their own directory, install the headers for the running kernel, and then
-install the driver and mixer.
+Download the two `.deb` files from
+[v0.1.0-alpha.4](https://github.com/Nsch11/maya44-linux/releases/tag/v0.1.0-alpha.4).
+These packages target Kubuntu 26.04 on amd64. Open a terminal in the download
+directory and run the following commands.
 
 ```sh
 sudo apt install "linux-headers-$(uname -r)"
-sudo apt install ./maya44e-dkms_*_amd64.deb ./maya44e-mixer_*_all.deb
+sudo apt install "$PWD"/maya44e-dkms_*_amd64.deb "$PWD"/maya44e-mixer_*_all.deb
 ```
 
-If you installed alpha.1 with `packaging/install.py`, remove that
-installation first using `sudo maya44e-install remove`. This keeps
-the saved ALSA state and leaves the running module loaded. The package
-refuses to overwrite an installation managed by the old script. Reboot
-after installing the driver to load the packaged build.
+If you previously installed the driver through `packaging/install.py`, run
+`sudo maya44e-install remove` before installing the packages. This preserves
+the saved ALSA state and leaves the running module loaded. Reboot after
+installing or upgrading the driver to load the new build.
 
 Start **MAYA44 Mixer** from the application menu or run
 `maya44e-mixer --show`. If the mixer from a source checkout is already
@@ -65,8 +71,8 @@ The resulting files are placed in the parent directory.
 ## Install the experimental driver from source
 
 The standalone DKMS installer targets Debian and Ubuntu systems with systemd
-and x86-64. Use it on systems where the `maya44e-dkms` package is absent.
-The driver was developed and tested on Kubuntu with Linux 7.0 kernels.
+and x86-64. Use it on a system without the `maya44e-dkms` package.
+The packaged driver was tested on Kubuntu 26.04 with Linux 7.0 kernels.
 Install matching kernel headers for every kernel you want DKMS to build for.
 The installer stops if `mokutil` reports that Secure Boot is enabled.
 
@@ -90,7 +96,7 @@ To compile the module without installing it, run `make -C kernel`.
 ## Run the mixer
 
 ```sh
-sudo apt install python3-pyqt6 qt6-wayland qt6-svg-plugins alsa-utils
+sudo apt install python3-pyqt6 qt6-wayland qt6-svg-plugins alsa-utils pipewire-bin pulseaudio-utils
 /usr/bin/python3 panel/maya44e.py --show
 ```
 
@@ -124,14 +130,15 @@ works independently of the two stereo devices.
 
 ## Known limits and test reports
 
-- External S/PDIF is awaiting hardware testing. The internal loopback was tested.
+- S/PDIF internal loopback was tested on the MAYA44e. External S/PDIF
+  input and output are awaiting hardware testing.
 - On the tested MAYA44e, a faint whine was audible in the left channel of
   output 3/4 under both Linux and Windows. It was much less noticeable at
   88.2 or 96 kHz.
 - If you hear dropouts at small periods, try 512 frames as a baseline.
-- Reports from XTe and eX owners are welcome. Include the card's PCI ID
-  (`lspci -nn -d 19fe:7000`), kernel version, sample rate, period size, and
-  the specific outputs, inputs or sleep modes you exercised.
+- If you test an XTe or eX, please include the PCI subsystem ID
+  (`lspci -nnv -d 19fe:7000`), kernel version, sample rate, period size, and
+  which inputs, outputs or suspend modes you tested.
 
 ## License and credits
 

@@ -9,8 +9,8 @@ locate the PCI initialization path in the vendor driver. The distributed
 module is built from the C source in this repository.
 
 OpenAI Codex assisted with reverse engineering, the Linux driver, the mixer
-and test tooling. The project owner tested playback on the physical MAYA44e
-and confirmed the audible results. The implementation used direct analysis
+and test tooling. Nordschamane tested playback on a physical
+MAYA44e and confirmed the audible results. The implementation used direct analysis
 of the vendor driver, so this project does not claim a clean-room process.
 
 The earliest mixer was adapted from [maya22gui 2.0 by Paul Petrov](https://sourceforge.net/projects/maya22gui/),
